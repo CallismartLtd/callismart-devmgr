@@ -9,7 +9,7 @@ set -e
 # └─────────────────────────────────────────────────────────────────┘
 
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.3.1"
 
 # Home of the person who invoked phpmgr, even when it runs as root through
 # sudo or pkexec (the desktop GUI), so the extensions file is theirs.
@@ -259,21 +259,26 @@ _CACHE_DPKG=""
 _CACHE_SYSTEMCTL=""
 _CACHE_ALT_LIST=""
 
+# The cache_* helpers are usually piped into `grep -q`, which exits at the
+# first match. If the calling process ignores SIGPIPE (pkexec / GUI launch),
+# the remaining write fails with "Broken pipe"; that is expected, so it is
+# silenced rather than reported.
+
 function cache_dpkg() {
     [ -z "$_CACHE_DPKG" ] && _CACHE_DPKG=$(dpkg -l 2>/dev/null)
-    echo "$_CACHE_DPKG"
+    printf '%s\n' "$_CACHE_DPKG" 2>/dev/null || true
 }
 
 function cache_systemctl() {
     [ -z "$_CACHE_SYSTEMCTL" ] && \
         _CACHE_SYSTEMCTL=$(systemctl list-units --type=service --all 2>/dev/null)
-    echo "$_CACHE_SYSTEMCTL"
+    printf '%s\n' "$_CACHE_SYSTEMCTL" 2>/dev/null || true
 }
 
 function cache_alt_list() {
     [ -z "$_CACHE_ALT_LIST" ] && \
         _CACHE_ALT_LIST=$(update-alternatives --list php 2>/dev/null || true)
-    echo "$_CACHE_ALT_LIST"
+    printf '%s\n' "$_CACHE_ALT_LIST" 2>/dev/null || true
 }
 
 # Call after any apt install/remove or alternatives change
@@ -472,13 +477,13 @@ function cmd_list_porcelain() {
 
         if echo "$running_fpm" | grep -q "^${ver}$"; then
             fpm="running"
-        elif echo "$systemctl_snap" | grep -q "php${ver}-fpm"; then
+        elif echo "$systemctl_snap" 2>/dev/null | grep -q "php${ver}-fpm"; then
             fpm="stopped"
         else
             fpm="-"
         fi
 
-        echo "$alt_snap" | grep -q "/usr/bin/php${ver}" && alt="yes" || alt="no"
+        echo "$alt_snap" 2>/dev/null | grep -q "/usr/bin/php${ver}" && alt="yes" || alt="no"
 
         printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$ver" "$full" "$cli" "$apache" "$fpm" "$alt"
     done
@@ -544,7 +549,7 @@ function cmd_list() {
         local fpm_label fpm_color
         if echo "$running_fpm" | grep -q "^${ver}$"; then
             fpm_label="● running"; fpm_color="${GREEN}${BOLD}"
-        elif echo "$systemctl_snap" | grep -q "php${ver}-fpm"; then
+        elif echo "$systemctl_snap" 2>/dev/null | grep -q "php${ver}-fpm"; then
             fpm_label="○ stopped"; fpm_color="$YELLOW"
         else
             fpm_label="—"; fpm_color="$DIM"
@@ -552,7 +557,7 @@ function cmd_list() {
 
         # Alternatives column — grep the snapshot
         local alt_label alt_color
-        if echo "$alt_snap" | grep -q "/usr/bin/php${ver}"; then
+        if echo "$alt_snap" 2>/dev/null | grep -q "/usr/bin/php${ver}"; then
             alt_label="yes"; alt_color="$GREEN"
         else
             alt_label="no"; alt_color="$DIM"
@@ -1055,7 +1060,7 @@ function cmd_fpm() {
                 units_snap=$(cache_systemctl)
                 for ver in $(get_all_installed_versions); do
                     local svc="php${ver}-fpm"
-                    if echo "$units_snap" | grep -q "${svc}"; then
+                    if echo "$units_snap" 2>/dev/null | grep -q "${svc}"; then
                         ui_step "${action^} ${svc}..."
                         sudo systemctl "$action" "$svc" 2>/dev/null && \
                             ui_success "${svc} → ${action}" || \
@@ -1358,6 +1363,12 @@ function cmd_ext_sync() {
 
     ui_step "Scanning extensions for PHP ${VERSION}..."
 
+    # Modules PHP already loads. Covers extensions with no package of their
+    # own: compiled in (sodium), or shipped inside another package
+    # (mysqli -> php-mysql, fileinfo/exif -> php-common).
+    local loaded
+    loaded=$("/usr/bin/php${VERSION}" -m 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+
     while read -r ext; do
         [ -z "$ext" ] && continue
 
@@ -1365,6 +1376,9 @@ function cmd_ext_sync() {
 
         if cache_dpkg | grep -q "^ii  ${pkg} "; then
             ui_info "${ext} already installed."
+            (( skipped++ )) || true
+        elif grep -qx "${ext,,}" <<< "$loaded"; then
+            ui_info "${ext} already available (built in or provided by another package)."
             (( skipped++ )) || true
         else
             missing+=( "$ext" )
@@ -1916,6 +1930,7 @@ function show_help() {
     printf "  %s%-30s%s %s\n" "$CYAN" "--no-prompt"         "$RESET" "Answer all prompts 'no', never pause (put before command)"
     printf "  %s%-30s%s %s\n" "$CYAN" "--yes <key>"         "$RESET" "Answer one prompt 'yes' (repeatable; implies --no-prompt)"
     printf "  %s%-30s%s %s\n" "$CYAN" "--sapi <list>"       "$RESET" "SAPIs for ext enable/disable, e.g. cli,fpm,apache2"
+    printf "  %s%-30s%s %s\n" "$CYAN" "--ext-file <path>"   "$RESET" "Extensions file (default ~/.phpmgr/extensions.txt)"
     printf "  %s%-30s%s %s\n" "$CYAN" "list --porcelain"    "$RESET" "Tab-separated version list for scripts"
     printf "  %s%-30s%s %s\n" "$CYAN" "ext list <ver> --porcelain" "$RESET" "Tab-separated module/SAPI state"
     ui_blank
@@ -1946,6 +1961,7 @@ function show_help() {
 #   --no-prompt         answer every yes/no prompt with "no", never pause
 #   --yes <key>         answer the prompt with this key "yes" (implies --no-prompt)
 #   --sapi <list>       comma list for ext enable/disable (cli,fpm,apache2)
+#   --ext-file <path>   extensions file to use (default ~/.phpmgr/extensions.txt)
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-prompt )
@@ -1967,6 +1983,16 @@ while [ $# -gt 0 ]; do
                 exit 1
             fi
             SAPI_LIST="$2"
+            shift 2
+            ;;
+        --ext-file )
+            # Same as PHPMGR_EXT_FILE, but survives sudo/pkexec, which
+            # strip the environment.
+            if [ -z "${2:-}" ]; then
+                ui_error "--ext-file requires a path"
+                exit 1
+            fi
+            EXT_FILE="$2"
             shift 2
             ;;
         * )

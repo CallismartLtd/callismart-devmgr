@@ -3,10 +3,10 @@ Version: @VERSION@
 Section: devel
 Priority: optional
 Architecture: all
-Maintainer: Callistus Nwachukwu <admin@callismart.com.ng>
+Maintainer: Callistus Nwachukwu <callistuselectricals@gmail.com>
 Depends: bash, python3, python3-gi, gir1.2-gtk-3.0, apache2, openssl, pkexec | policykit-1
 Recommends: mkcert, libnss3-tools
-Homepage: https://github.com/callismartLtd/callismart-devmgr
+Homepage: https://github.com/CallismartLtd/callismart-devmgr
 Description: Desktop manager for local Apache sites, PHP versions and SSL
  Callismart Dev Manager is a GTK app on top of three command-line tools:
  sitemgr (Apache vhosts, document roots, per-site PHP through mod_php or

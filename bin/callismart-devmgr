@@ -27,6 +27,7 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk  # noqa: E402
 
 BASE_WWW = "/var/www"
+DEFAULT_LOG_DIR = "/var/log/apache2"
 
 # Must stay in sync with DOMAIN_RE in sitemgr / localssl.
 DOMAIN_RE = re.compile(
@@ -132,9 +133,9 @@ def confirm(parent, title, detail, action_label, extra_check=None):
     return response == Gtk.ResponseType.OK, state
 
 
-def pick_folder(parent, entry):
+def pick_folder(parent, entry, title="Select document root"):
     dialog = Gtk.FileChooserDialog(
-        title="Select document root",
+        title=title,
         transient_for=parent,
         action=Gtk.FileChooserAction.SELECT_FOLDER,
     )
@@ -144,6 +145,36 @@ def pick_folder(parent, entry):
     if dialog.run() == Gtk.ResponseType.OK:
         entry.set_text(dialog.get_filename())
     dialog.destroy()
+
+
+# ---------- settings ----------
+
+class Settings:
+    """Small per-user settings file: ~/.config/callismart-devmgr/settings.ini"""
+
+    GROUP = "general"
+
+    def __init__(self):
+        self.path = os.path.join(GLib.get_user_config_dir(), "callismart-devmgr", "settings.ini")
+        self.keyfile = GLib.KeyFile()
+        try:
+            self.keyfile.load_from_file(self.path, GLib.KeyFileFlags.NONE)
+        except GLib.Error:
+            pass  # first run, or unreadable: start empty
+
+    def get(self, key, default=None):
+        try:
+            return self.keyfile.get_string(self.GROUP, key)
+        except GLib.Error:
+            return default
+
+    def set(self, key, value):
+        self.keyfile.set_string(self.GROUP, key, value)
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            self.keyfile.save_to_file(self.path)
+        except (OSError, GLib.Error):
+            pass  # not fatal: the value just isn't remembered
 
 
 # ---------- command runner ----------
@@ -273,8 +304,10 @@ class LogWindow(Gtk.Window):
         refresh.connect("clicked", lambda *_: self.load())
         header.pack_end(refresh)
 
-        self.view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True)
+        self.view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True,
+                                 wrap_mode=Gtk.WrapMode.WORD_CHAR)
         self.view.set_left_margin(6)
+        self.view.set_right_margin(6)
         self.add(scrolled(self.view))
         self.show_all()
         self.load()
@@ -306,7 +339,7 @@ class LogWindow(Gtk.Window):
 
 class SitesPage(Gtk.Paned):
     # Store columns
-    NAME, MANAGED, ENABLED, SSL, PHP, DOCROOT = range(6)
+    NAME, MANAGED, ENABLED, SSL, PHP, DOCROOT, LOGDIR = range(7)
 
     def __init__(self, window, runner, sitemgr):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
@@ -327,7 +360,7 @@ class SitesPage(Gtk.Paned):
         bar.pack_end(refresh, False, False, 0)
         left.pack_start(bar, False, False, 0)
 
-        self.store = Gtk.ListStore(str, str, str, str, str, str)
+        self.store = Gtk.ListStore(str, str, str, str, str, str, str)
         self.tree = Gtk.TreeView(model=self.store)
         for title, col in (("Site", self.NAME), ("Enabled", self.ENABLED), ("HTTPS", self.SSL),
                            ("PHP", self.PHP), ("Managed", self.MANAGED)):
@@ -355,6 +388,7 @@ class SitesPage(Gtk.Paned):
         grid.attach(label("Document root"), 0, 1, 1, 1)
         self.docroot = Gtk.Entry(hexpand=True)
         self.docroot.set_tooltip_text("Must resolve inside %s/." % BASE_WWW)
+        self.docroot.connect("changed", lambda *_: self.on_logdir_changed())
         grid.attach(self.docroot, 1, 1, 1, 1)
         self.browse = button("Browse…", lambda *_: pick_folder(self.window, self.docroot))
         grid.attach(self.browse, 2, 1, 1, 1)
@@ -372,6 +406,22 @@ class SitesPage(Gtk.Paned):
 
         self.ssl = Gtk.CheckButton(label="HTTPS (local certificate via localssl / mkcert)")
         grid.attach(self.ssl, 1, 4, 2, 1)
+
+        grid.attach(label("Log directory"), 0, 5, 1, 1)
+        self.logdir = Gtk.Entry(hexpand=True, placeholder_text="%s (Apache default)" % DEFAULT_LOG_DIR)
+        self.logdir.set_tooltip_text(
+            "Where <domain>-error.log and <domain>-access.log are written. Leave empty for "
+            "Apache's default. A folder next to the document root (e.g. /var/www/shop/logs) "
+            "keeps logs with the project without making them downloadable."
+        )
+        self.logdir.connect("changed", self.on_logdir_changed)
+        grid.attach(self.logdir, 1, 5, 1, 1)
+        self.logdir_browse = button("Browse…", lambda *_: pick_folder(self.window, self.logdir, "Select log directory"))
+        grid.attach(self.logdir_browse, 2, 5, 1, 1)
+
+        self.logdir_note = Gtk.Label(xalign=0, wrap=True)
+        self.logdir_note.get_style_context().add_class("dim-label")
+        grid.attach(self.logdir_note, 1, 6, 2, 1)
 
         self.note = Gtk.Label(xalign=0, wrap=True)
         self.note.get_style_context().add_class("dim-label")
@@ -432,9 +482,9 @@ class SitesPage(Gtk.Paned):
         target = None
         for line in out.splitlines():
             parts = line.split("\t")
-            if len(parts) != 6:
+            if len(parts) != 7:
                 continue
-            name, managed, enabled, ssl, php, root = parts
+            name, managed, enabled, ssl, php, root, logdir = parts
             it = self.store.append([
                 name,
                 "yes" if managed == "yes" else "—",
@@ -442,6 +492,7 @@ class SitesPage(Gtk.Paned):
                 ssl,
                 php if managed == "yes" else php + "?",
                 root,
+                logdir,
             ])
             if name == select:
                 target = it
@@ -456,7 +507,8 @@ class SitesPage(Gtk.Paned):
         self.mode = mode
         editable = mode in ("new", "edit", "adopt")
         self.domain.set_sensitive(mode == "new")
-        for widget in (self.docroot, self.browse, self.create_docroot, self.php, self.ssl):
+        for widget in (self.docroot, self.browse, self.create_docroot, self.php, self.ssl,
+                       self.logdir, self.logdir_browse):
             widget.set_sensitive(editable)
         self.primary.set_visible(editable)
         self.primary.set_label({"new": "Create site", "edit": "Save changes", "adopt": "Adopt…"}.get(mode, ""))
@@ -475,6 +527,7 @@ class SitesPage(Gtk.Paned):
         self.docroot.set_text("")
         self.create_docroot.set_active(True)
         self.ssl.set_active(True)
+        self.logdir.set_text("")
         self.fill_php("mod_php")
         self.note.set_text("")
         self.toggle.set_label("Disable")
@@ -497,6 +550,7 @@ class SitesPage(Gtk.Paned):
         self.docroot.set_text(row[self.DOCROOT])
         self.create_docroot.set_active(False)
         self.ssl.set_active(row[self.SSL] == "on")
+        self.logdir.set_text("" if row[self.LOGDIR] == "default" else row[self.LOGDIR])
         self.fill_php(php)
         self.toggle.set_label("Disable" if row[self.ENABLED] == "✔" else "Enable")
 
@@ -513,6 +567,20 @@ class SitesPage(Gtk.Paned):
             )
             self.set_mode("adopt")
 
+    def on_logdir_changed(self, *_):
+        logdir = self.logdir.get_text().strip().rstrip("/")
+        root = (self.docroot.get_text().strip() or self.docroot.get_placeholder_text() or "").split(" (")[0].rstrip("/")
+        if logdir and root and (logdir == root or logdir.startswith(root + "/")):
+            self.logdir_note.set_text(
+                "Inside the document root: Apache will be told not to serve this folder, "
+                "but a folder next to the docroot is safer." if logdir != root else
+                "Can't be the document root itself — use a folder next to it."
+            )
+        elif logdir:
+            self.logdir_note.set_text("A logrotate rule is added for this folder.")
+        else:
+            self.logdir_note.set_text("")
+
     def on_domain_changed(self, entry):
         if self.mode == "new":
             domain = entry.get_text().strip() or "<domain>"
@@ -527,6 +595,11 @@ class SitesPage(Gtk.Paned):
             args += ["--docroot", docroot]
         args += ["--php", self.php.get_active_id() or "mod_php"]
         args.append("--ssl" if self.ssl.get_active() else "--no-ssl")
+        logdir = self.logdir.get_text().strip()
+        if logdir:
+            args += ["--log-dir", logdir]
+        elif self.mode == "edit":
+            args += ["--log-dir", "default"]  # emptied field = back to Apache's default
         if self.create_docroot.get_active():
             args.append("--create-docroot")
         return args
@@ -645,7 +718,7 @@ class PhpPage(Gtk.Paned):
         row.pack_start(button("Install", self.on_install, "suggested-action"), False, False, 0)
         box.pack_start(row, False, False, 0)
         self.opt_mod_php = Gtk.CheckButton(label="Also install Apache mod_php")
-        self.opt_ext_file = Gtk.CheckButton(label="Install extensions from my extensions file")
+        self.opt_ext_file = Gtk.CheckButton(label="Install extensions from the extensions file")
         self.opt_cli = Gtk.CheckButton(label="Make it the default CLI version")
         self.opt_apache = Gtk.CheckButton(label="Switch Apache mod_php to it")
         for widget in (self.opt_mod_php, self.opt_ext_file, self.opt_cli, self.opt_apache):
@@ -709,6 +782,22 @@ class PhpPage(Gtk.Paned):
             widget = button(text, handler)
             row.pack_start(widget, False, False, 0)
             self.version_actions.append(widget)
+        right.pack_start(row, False, False, 0)
+
+        row = Gtk.Box(spacing=8)
+        row.pack_start(label("Extensions file:"), False, False, 0)
+        self.ext_file = Gtk.FileChooserButton(title="Choose extensions file", action=Gtk.FileChooserAction.OPEN)
+        self.ext_file.set_tooltip_text(
+            "One extension name per line. Used by “Sync from file” and by "
+            "“Install extensions from the extensions file” when installing PHP."
+        )
+        saved = self.window.settings.get("ext_file") or os.path.expanduser("~/.phpmgr/extensions.txt")
+        if os.path.isfile(saved):
+            self.ext_file.set_filename(saved)
+        else:
+            self.ext_file.set_current_folder(os.path.expanduser("~"))
+        self.ext_file.connect("file-set", self.on_ext_file_set)
+        row.pack_start(self.ext_file, True, True, 0)
         right.pack_start(row, False, False, 0)
 
         row = Gtk.Box(spacing=8)
@@ -805,12 +894,30 @@ class PhpPage(Gtk.Paned):
 
     # ----- actions -----
 
+    def on_ext_file_set(self, chooser):
+        path = chooser.get_filename()
+        if path:
+            self.window.settings.set("ext_file", path)
+
+    def ext_file_args(self):
+        """--ext-file for phpmgr, or None (after logging why) if none is chosen."""
+        path = self.ext_file.get_filename()
+        if not path or not os.path.isfile(path):
+            self.runner.log("❌ Choose an extensions file first (one extension name per line).\n")
+            return None
+        return ["--ext-file", path]
+
     def on_install(self, *_):
         ver = self.new_version.get_text().strip()
         if not VERSION_RE.match(ver):
             self.runner.log("❌ Enter a version like 8.4\n")
             return
         args = ["--no-prompt"]
+        if self.opt_ext_file.get_active():
+            ext_args = self.ext_file_args()
+            if ext_args is None:
+                return
+            args += ext_args
         for check, key in ((self.opt_mod_php, "mod-php"), (self.opt_ext_file, "ext-file"),
                            (self.opt_cli, "use-cli"), (self.opt_apache, "use-apache")):
             if check.get_active():
@@ -902,7 +1009,10 @@ class PhpPage(Gtk.Paned):
         self.runner.run(self.phpmgr, ["ext", "search", self.version, term[0]])
 
     def on_pkg_sync(self, *_):
-        self.runner.run(self.phpmgr, ["--no-prompt", "ext", "sync", self.version],
+        ext_args = self.ext_file_args()
+        if ext_args is None:
+            return
+        self.runner.run(self.phpmgr, ["--no-prompt"] + ext_args + ["ext", "sync", self.version],
                         privileged=True, on_done=self.after)
 
 
@@ -1057,6 +1167,7 @@ class ManagerWindow(Gtk.Window):
     def __init__(self, tools):
         super().__init__(title="Callismart Dev Manager")
         self.set_default_size(1100, 720)
+        self.settings = Settings()
 
         header = Gtk.HeaderBar(show_close_button=True)
         self.set_titlebar(header)
