@@ -1,0 +1,1143 @@
+#!/usr/bin/env python3
+"""
+Callismart Dev Manager - GTK desktop front end for the local dev tools:
+
+  Sites  -> sitemgr   (Apache vhosts, document roots, per-site PHP, HTTPS)
+  PHP    -> phpmgr    (PHP versions, FPM services, extensions)
+  SSL    -> localssl  (certificates for domains outside sitemgr)
+
+The app never edits system files itself. It builds the command line you
+would type and runs the CLI: read-only commands run as you, anything that
+changes the system runs through pkexec (graphical password prompt).
+
+Author: Callistus Nwachukwu
+"""
+
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gtk  # noqa: E402
+
+BASE_WWW = "/var/www"
+
+# Must stay in sync with DOMAIN_RE in sitemgr / localssl.
+DOMAIN_RE = re.compile(
+    r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$"
+)
+VERSION_RE = re.compile(r"^\d+\.\d+$")
+PACKAGE_RE = re.compile(r"^[a-z0-9][a-z0-9_.+-]*$")
+
+# localssl `list` row: "  smartwoo.local      expires: Jan  1 ..."
+SSL_LIST_ROW_RE = re.compile(r"^\s+(\S+)\s+expires:\s*(.*)$")
+
+# pkexec exit codes when the password prompt is dismissed / fails.
+PKEXEC_AUTH_CODES = (126, 127)
+
+# sitemgr logs: exit code when the log file is not readable.
+LOGS_NEED_ROOT = 3
+
+
+# ---------- discovery ----------
+
+def find_tool(env_var, names):
+    """Locate a CLI: $ENV_VAR, then PATH, then /usr/local/bin, then next to this file."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    candidates = [os.environ.get(env_var)]
+    candidates += [shutil.which(name) for name in names]
+    candidates += [os.path.join("/usr/local/bin", name) for name in names]
+    candidates += [os.path.join(here, name) for name in names]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            # pkexec requires an absolute path.
+            return os.path.realpath(path)
+    return None
+
+
+def version_key(version):
+    return tuple(int(part) for part in version.split("."))
+
+
+def fpm_versions():
+    """PHP versions that have an FPM binary installed."""
+    found = []
+    for path in glob.glob("/usr/sbin/php-fpm*"):
+        match = re.search(r"php-fpm(\d+\.\d+)$", path)
+        if match:
+            found.append(match.group(1))
+    return sorted(found, key=version_key)
+
+
+def mod_php_version():
+    """The PHP version Apache's mod_php currently loads, if any."""
+    for path in glob.glob("/etc/apache2/mods-enabled/php*.load"):
+        match = re.search(r"php(\d+\.\d+)\.load$", path)
+        if match:
+            return match.group(1)
+    return None
+
+
+# ---------- small widget helpers ----------
+
+def label(text, **kwargs):
+    return Gtk.Label(label=text, xalign=0, **kwargs)
+
+
+def button(text, handler, style=None, tooltip=None):
+    widget = Gtk.Button(label=text)
+    if style:
+        widget.get_style_context().add_class(style)
+    if tooltip:
+        widget.set_tooltip_text(tooltip)
+    widget.connect("clicked", handler)
+    return widget
+
+
+def scrolled(child, width=-1, height=-1):
+    box = Gtk.ScrolledWindow()
+    box.set_size_request(width, height)
+    box.add(child)
+    return box
+
+
+def confirm(parent, title, detail, action_label, extra_check=None):
+    """Modal confirm dialog. extra_check: optional label for a checkbox.
+    Returns (confirmed, checkbox_state)."""
+    dialog = Gtk.MessageDialog(
+        transient_for=parent,
+        modal=True,
+        message_type=Gtk.MessageType.WARNING,
+        buttons=Gtk.ButtonsType.NONE,
+        text=title,
+    )
+    dialog.format_secondary_text(detail)
+    check = None
+    if extra_check:
+        check = Gtk.CheckButton(label=extra_check)
+        dialog.get_message_area().pack_start(check, False, False, 0)
+        check.show()
+    dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+    ok = dialog.add_button(action_label, Gtk.ResponseType.OK)
+    ok.get_style_context().add_class("destructive-action")
+    response = dialog.run()
+    state = check.get_active() if check else False
+    dialog.destroy()
+    return response == Gtk.ResponseType.OK, state
+
+
+def pick_folder(parent, entry):
+    dialog = Gtk.FileChooserDialog(
+        title="Select document root",
+        transient_for=parent,
+        action=Gtk.FileChooserAction.SELECT_FOLDER,
+    )
+    dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Select", Gtk.ResponseType.OK)
+    current = entry.get_text().strip()
+    dialog.set_current_folder(current if os.path.isdir(current) else BASE_WWW)
+    if dialog.run() == Gtk.ResponseType.OK:
+        entry.set_text(dialog.get_filename())
+    dialog.destroy()
+
+
+# ---------- command runner ----------
+
+class Runner:
+    """Runs CLI commands in worker threads.
+
+    run()     - one action at a time, output streamed into the shared log.
+    capture() - silent background read (lists, logs); output handed to a callback.
+    """
+
+    def __init__(self, log_view, on_busy):
+        self.log_view = log_view
+        self.on_busy = on_busy
+        self.busy = False
+
+    def log(self, text):
+        buf = self.log_view.get_buffer()
+        buf.insert(buf.get_end_iter(), text)
+        buf.place_cursor(buf.get_end_iter())
+        self.log_view.scroll_mark_onscreen(buf.get_insert())
+        return False  # one-shot for GLib.idle_add
+
+    def run(self, tool, args, privileged=False, on_done=None):
+        if self.busy:
+            return
+        self.busy = True
+        self.on_busy(True)
+
+        if self.log_view.get_buffer().get_char_count():
+            self.log("\n")
+        shown = " ".join([os.path.basename(tool)] + [GLib.shell_quote(a) for a in args])
+        self.log("$ %s%s\n" % ("sudo " if privileged else "", shown))
+
+        cmd = (["pkexec"] if privileged else []) + [tool] + args
+
+        def worker():
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,  # a CLI must never wait on a prompt
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                )
+                for line in proc.stdout:
+                    GLib.idle_add(self.log, line)
+                code = proc.wait()
+            except OSError as exc:
+                code = -1
+                GLib.idle_add(self.log, "❌ %s\n" % exc)
+            GLib.idle_add(self._finish, code, privileged, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish(self, code, privileged, on_done):
+        self.busy = False
+        self.on_busy(False)
+        if privileged and code in PKEXEC_AUTH_CODES:
+            self.log("🔒 Authentication cancelled or not authorized.\n")
+        elif code != 0:
+            self.log("(exited with code %d)\n" % code)
+        if on_done:
+            on_done(code)
+        return False
+
+    def capture(self, tool, args, callback, privileged=False):
+        cmd = (["pkexec"] if privileged else []) + [tool] + args
+
+        def worker():
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                    timeout=180,
+                )
+                code, out = proc.returncode, proc.stdout
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                code, out = -1, str(exc)
+            GLib.idle_add(self._deliver, callback, code, out)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _deliver(callback, code, out):
+        callback(code, out)
+        return False
+
+
+# ---------- Sites tab (sitemgr) ----------
+
+class LogWindow(Gtk.Window):
+    """Tail of a site's Apache error/access log."""
+
+    def __init__(self, parent, runner, sitemgr, domain, kind):
+        super().__init__(title="%s logs" % domain, transient_for=parent)
+        self.runner = runner
+        self.sitemgr = sitemgr
+        self.domain = domain
+        self.elevated = False
+        self.set_default_size(900, 520)
+
+        header = Gtk.HeaderBar(show_close_button=True, title=domain, subtitle="Apache logs")
+        self.set_titlebar(header)
+
+        self.kind = Gtk.ComboBoxText()
+        self.kind.append("error", "Error log")
+        self.kind.append("access", "Access log")
+        self.kind.set_active_id(kind)
+        self.kind.connect("changed", lambda *_: self.load())
+        header.pack_start(self.kind)
+
+        self.lines = Gtk.ComboBoxText()
+        for count in ("100", "200", "500", "1000"):
+            self.lines.append(count, "Last %s lines" % count)
+        self.lines.set_active_id("200")
+        self.lines.connect("changed", lambda *_: self.load())
+        header.pack_start(self.lines)
+
+        refresh = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        refresh.set_tooltip_text("Reload")
+        refresh.connect("clicked", lambda *_: self.load())
+        header.pack_end(refresh)
+
+        self.view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True)
+        self.view.set_left_margin(6)
+        self.add(scrolled(self.view))
+        self.show_all()
+        self.load()
+
+    def load(self):
+        args = [
+            "logs", "--domain", self.domain,
+            "--" + self.kind.get_active_id(),
+            "--lines", self.lines.get_active_id(),
+        ]
+        self.view.get_buffer().set_text("Loading…")
+        self.runner.capture(self.sitemgr, args, lambda code, out: self.show(code, out, args),
+                            privileged=self.elevated)
+
+    def show(self, code, out, args):
+        if code == LOGS_NEED_ROOT and not self.elevated:
+            # Not in the adm group: read it once through pkexec, then keep doing so.
+            self.elevated = True
+            self.runner.capture(self.sitemgr, args, lambda c, o: self.show(c, o, args), privileged=True)
+            return
+        if self.elevated and code in PKEXEC_AUTH_CODES:
+            out = "🔒 Authentication cancelled. " + out
+            self.elevated = False
+        buf = self.view.get_buffer()
+        buf.set_text(out or "(empty)")
+        buf.place_cursor(buf.get_end_iter())
+        self.view.scroll_mark_onscreen(buf.get_insert())
+
+
+class SitesPage(Gtk.Paned):
+    # Store columns
+    NAME, MANAGED, ENABLED, SSL, PHP, DOCROOT = range(6)
+
+    def __init__(self, window, runner, sitemgr):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
+        self.window = window
+        self.runner = runner
+        self.sitemgr = sitemgr
+        self.mode = "new"          # new | edit | adopt | readonly
+        self.current = None        # row tuple of the selected site
+
+        # Left: site list
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        left.set_border_width(6)
+        bar = Gtk.Box(spacing=6)
+        bar.pack_start(button("New site", lambda *_: self.new_site(), "suggested-action"), False, False, 0)
+        refresh = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        refresh.set_tooltip_text("Reload site list")
+        refresh.connect("clicked", lambda *_: self.refresh())
+        bar.pack_end(refresh, False, False, 0)
+        left.pack_start(bar, False, False, 0)
+
+        self.store = Gtk.ListStore(str, str, str, str, str, str)
+        self.tree = Gtk.TreeView(model=self.store)
+        for title, col in (("Site", self.NAME), ("Enabled", self.ENABLED), ("HTTPS", self.SSL),
+                           ("PHP", self.PHP), ("Managed", self.MANAGED)):
+            self.tree.append_column(Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=col))
+        self.tree.get_selection().connect("changed", self.on_select)
+        left.pack_start(scrolled(self.tree, width=420), True, True, 0)
+        self.pack1(left, resize=False, shrink=False)
+
+        # Right: site form
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        right.set_border_width(12)
+        self.pack2(right, resize=True, shrink=False)
+
+        self.heading = Gtk.Label(xalign=0)
+        right.pack_start(self.heading, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=8, row_spacing=8)
+        right.pack_start(grid, False, False, 0)
+
+        grid.attach(label("Domain"), 0, 0, 1, 1)
+        self.domain = Gtk.Entry(hexpand=True, placeholder_text="shop.local")
+        self.domain.connect("changed", self.on_domain_changed)
+        grid.attach(self.domain, 1, 0, 2, 1)
+
+        grid.attach(label("Document root"), 0, 1, 1, 1)
+        self.docroot = Gtk.Entry(hexpand=True)
+        self.docroot.set_tooltip_text("Must resolve inside %s/." % BASE_WWW)
+        grid.attach(self.docroot, 1, 1, 1, 1)
+        self.browse = button("Browse…", lambda *_: pick_folder(self.window, self.docroot))
+        grid.attach(self.browse, 2, 1, 1, 1)
+
+        self.create_docroot = Gtk.CheckButton(label="Create the document root if it doesn't exist")
+        grid.attach(self.create_docroot, 1, 2, 2, 1)
+
+        grid.attach(label("PHP"), 0, 3, 1, 1)
+        self.php = Gtk.ComboBoxText(hexpand=True)
+        self.php.set_tooltip_text(
+            "mod_php uses Apache's single global PHP version.\n"
+            "PHP-FPM gives this site its own version, side by side with others."
+        )
+        grid.attach(self.php, 1, 3, 2, 1)
+
+        self.ssl = Gtk.CheckButton(label="HTTPS (local certificate via localssl / mkcert)")
+        grid.attach(self.ssl, 1, 4, 2, 1)
+
+        self.note = Gtk.Label(xalign=0, wrap=True)
+        self.note.get_style_context().add_class("dim-label")
+        right.pack_start(self.note, False, False, 0)
+
+        row1 = Gtk.Box(spacing=8)
+        right.pack_start(row1, False, False, 0)
+        self.primary = button("Create site", self.on_primary, "suggested-action")
+        self.toggle = button("Disable", self.on_toggle)
+        self.delete = button("Delete…", self.on_delete, "destructive-action")
+        for widget in (self.primary, self.toggle, self.delete):
+            row1.pack_start(widget, False, False, 0)
+
+        row2 = Gtk.Box(spacing=8)
+        right.pack_start(row2, False, False, 0)
+        self.status = button("Status", self.on_status)
+        self.open = button("Open in browser", self.on_open)
+        self.error_log = button("Error log", lambda *_: self.on_logs("error"))
+        self.access_log = button("Access log", lambda *_: self.on_logs("access"))
+        for widget in (self.status, self.open, self.error_log, self.access_log):
+            row2.pack_start(widget, False, False, 0)
+
+        self.new_site()
+        self.refresh()
+
+    # ----- data -----
+
+    def on_shown(self):
+        # PHP versions may have changed on the PHP tab.
+        self.fill_php(self.php.get_active_id() or "mod_php")
+
+    def fill_php(self, selected):
+        self.php.remove_all()
+        global_ver = mod_php_version()
+        self.php.append(
+            "mod_php",
+            "mod_php — Apache global (%s)" % ("PHP " + global_ver if global_ver else "none enabled"),
+        )
+        ids = ["mod_php"]
+        for ver in fpm_versions():
+            self.php.append("fpm:" + ver, "PHP-FPM %s" % ver)
+            ids.append("fpm:" + ver)
+        if selected and selected not in ids:
+            self.php.append(selected, "%s (not installed)" % selected)
+        self.php.set_active_id(selected or "mod_php")
+
+    def refresh(self, select=None):
+        if select is None and self.current:
+            select = self.current[self.NAME]
+        self.runner.capture(self.sitemgr, ["list", "--porcelain"],
+                            lambda code, out: self.fill_list(code, out, select))
+
+    def fill_list(self, code, out, select):
+        self.store.clear()
+        if code != 0:
+            self.runner.log("❌ Could not list sites:\n%s" % out)
+            return
+        target = None
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 6:
+                continue
+            name, managed, enabled, ssl, php, root = parts
+            it = self.store.append([
+                name,
+                "yes" if managed == "yes" else "—",
+                "✔" if enabled == "yes" else "—",
+                ssl,
+                php if managed == "yes" else php + "?",
+                root,
+            ])
+            if name == select:
+                target = it
+        if target is not None:
+            self.tree.get_selection().select_iter(target)
+        elif self.mode != "new":
+            self.new_site()
+
+    # ----- form state -----
+
+    def set_mode(self, mode):
+        self.mode = mode
+        editable = mode in ("new", "edit", "adopt")
+        self.domain.set_sensitive(mode == "new")
+        for widget in (self.docroot, self.browse, self.create_docroot, self.php, self.ssl):
+            widget.set_sensitive(editable)
+        self.primary.set_visible(editable)
+        self.primary.set_label({"new": "Create site", "edit": "Save changes", "adopt": "Adopt…"}.get(mode, ""))
+        existing = mode != "new"
+        has_domain = mode != "readonly"
+        self.toggle.set_sensitive(existing and has_domain)
+        self.delete.set_sensitive(mode == "edit")
+        for widget in (self.status, self.open, self.error_log, self.access_log):
+            widget.set_sensitive(existing and has_domain)
+
+    def new_site(self):
+        self.current = None
+        self.tree.get_selection().unselect_all()
+        self.heading.set_markup("<b>New site</b>")
+        self.domain.set_text("")
+        self.docroot.set_text("")
+        self.create_docroot.set_active(True)
+        self.ssl.set_active(True)
+        self.fill_php("mod_php")
+        self.note.set_text("")
+        self.toggle.set_label("Disable")
+        self.set_mode("new")
+        self.on_domain_changed(self.domain)
+        self.domain.grab_focus()
+
+    def on_select(self, selection):
+        model, it = selection.get_selected()
+        if it is None:
+            return
+        row = tuple(model[it])
+        self.current = row
+        name = row[self.NAME]
+        managed = row[self.MANAGED] == "yes"
+        php = row[self.PHP].rstrip("?")
+
+        self.heading.set_markup("<b>%s</b>" % GLib.markup_escape_text(name))
+        self.domain.set_text(name)
+        self.docroot.set_text(row[self.DOCROOT])
+        self.create_docroot.set_active(False)
+        self.ssl.set_active(row[self.SSL] == "on")
+        self.fill_php(php)
+        self.toggle.set_label("Disable" if row[self.ENABLED] == "✔" else "Enable")
+
+        if not DOMAIN_RE.match(name):
+            self.note.set_text("“%s” isn't a domain name, so sitemgr leaves it alone." % name)
+            self.set_mode("readonly")
+        elif managed:
+            self.note.set_text("")
+            self.set_mode("edit")
+        else:
+            self.note.set_text(
+                "Not created by sitemgr. Values below were detected from the vhost; "
+                "Adopt rewrites it from sitemgr's template (the original is backed up)."
+            )
+            self.set_mode("adopt")
+
+    def on_domain_changed(self, entry):
+        if self.mode == "new":
+            domain = entry.get_text().strip() or "<domain>"
+            self.docroot.set_placeholder_text("%s/html/%s (default)" % (BASE_WWW, domain))
+
+    # ----- actions -----
+
+    def form_args(self):
+        args = []
+        docroot = self.docroot.get_text().strip()
+        if docroot:
+            args += ["--docroot", docroot]
+        args += ["--php", self.php.get_active_id() or "mod_php"]
+        args.append("--ssl" if self.ssl.get_active() else "--no-ssl")
+        if self.create_docroot.get_active():
+            args.append("--create-docroot")
+        return args
+
+    def domain_value(self):
+        domain = self.domain.get_text().strip()
+        if not DOMAIN_RE.match(domain):
+            self.runner.log("❌ Invalid domain: %s\n" % (domain or "(empty)"))
+            return None
+        return domain
+
+    def after(self, domain):
+        return lambda code: self.refresh(select=domain)
+
+    def on_primary(self, *_):
+        domain = self.domain_value()
+        if not domain:
+            return
+        if self.mode == "new":
+            self.runner.run(self.sitemgr, ["create", "--domain", domain] + self.form_args(),
+                            privileged=True, on_done=self.after(domain))
+        elif self.mode == "edit":
+            self.runner.run(self.sitemgr, ["edit", "--domain", domain] + self.form_args(),
+                            privileged=True, on_done=self.after(domain))
+        elif self.mode == "adopt":
+            ok, _ = confirm(
+                self.window,
+                "Adopt %s?" % domain,
+                "The vhost is rewritten from sitemgr's template using the values in the form. "
+                "Custom directives in it are dropped; the original is saved in /var/backups/sitemgr.",
+                "Adopt",
+            )
+            if ok:
+                self.runner.run(self.sitemgr, ["adopt", "--domain", domain, "--yes"] + self.form_args(),
+                                privileged=True, on_done=self.after(domain))
+
+    def on_toggle(self, *_):
+        domain = self.domain_value()
+        if domain:
+            action = "enable" if self.toggle.get_label() == "Enable" else "disable"
+            self.runner.run(self.sitemgr, [action, "--domain", domain],
+                            privileged=True, on_done=self.after(domain))
+
+    def on_delete(self, *_):
+        domain = self.domain_value()
+        if not domain:
+            return
+        ok, keep_cert = confirm(
+            self.window,
+            "Delete %s?" % domain,
+            "Removes the vhost, the /etc/hosts entry and the certificate. "
+            "The document root and log files are kept.",
+            "Delete",
+            extra_check="Keep the certificate",
+        )
+        if ok:
+            args = ["delete", "--domain", domain, "--yes"] + (["--keep-cert"] if keep_cert else [])
+            self.current = None
+            self.runner.run(self.sitemgr, args, privileged=True, on_done=lambda code: self.refresh())
+
+    def on_status(self, *_):
+        domain = self.domain_value()
+        if domain:
+            self.runner.run(self.sitemgr, ["status", "--domain", domain])
+
+    def on_open(self, *_):
+        domain = self.domain_value()
+        if domain:
+            scheme = "https" if self.current and self.current[self.SSL] == "on" else "http"
+            try:
+                Gtk.show_uri_on_window(self.window, "%s://%s" % (scheme, domain), Gtk.get_current_event_time())
+            except GLib.Error as exc:
+                self.runner.log("❌ Could not open browser: %s\n" % exc.message)
+
+    def on_logs(self, kind):
+        domain = self.domain_value()
+        if domain:
+            LogWindow(self.window, self.runner, self.sitemgr, domain, kind)
+
+
+# ---------- PHP tab (phpmgr) ----------
+
+class PhpPage(Gtk.Paned):
+    def __init__(self, window, runner, phpmgr):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
+        self.window = window
+        self.runner = runner
+        self.phpmgr = phpmgr
+        self.version = None
+
+        # Left: installed versions + install form
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        left.set_border_width(6)
+        bar = Gtk.Box(spacing=6)
+        bar.pack_start(label("<b>Installed versions</b>", use_markup=True), False, False, 0)
+        refresh = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        refresh.set_tooltip_text("Reload")
+        refresh.connect("clicked", lambda *_: self.refresh())
+        bar.pack_end(refresh, False, False, 0)
+        left.pack_start(bar, False, False, 0)
+
+        self.versions = Gtk.ListStore(str, str, str, str, str)
+        self.version_tree = Gtk.TreeView(model=self.versions)
+        for i, title in enumerate(("Version", "Full", "CLI", "Apache", "FPM")):
+            self.version_tree.append_column(Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=i))
+        self.version_tree.get_selection().connect("changed", self.on_select)
+        left.pack_start(scrolled(self.version_tree, width=380, height=180), True, True, 0)
+
+        install = Gtk.Frame(label=" Install a PHP version ")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_border_width(8)
+        install.add(box)
+        row = Gtk.Box(spacing=6)
+        self.new_version = Gtk.Entry(placeholder_text="8.4", width_chars=8)
+        row.pack_start(self.new_version, False, False, 0)
+        row.pack_start(button("Install", self.on_install, "suggested-action"), False, False, 0)
+        box.pack_start(row, False, False, 0)
+        self.opt_mod_php = Gtk.CheckButton(label="Also install Apache mod_php")
+        self.opt_ext_file = Gtk.CheckButton(label="Install extensions from my extensions file")
+        self.opt_cli = Gtk.CheckButton(label="Make it the default CLI version")
+        self.opt_apache = Gtk.CheckButton(label="Switch Apache mod_php to it")
+        for widget in (self.opt_mod_php, self.opt_ext_file, self.opt_cli, self.opt_apache):
+            box.pack_start(widget, False, False, 0)
+        hint = label("PHP-FPM is always installed, so sites can use the version right away.", wrap=True)
+        hint.get_style_context().add_class("dim-label")
+        box.pack_start(hint, False, False, 0)
+        left.pack_start(install, False, False, 0)
+        self.pack1(left, resize=False, shrink=False)
+
+        # Right: selected version
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        right.set_border_width(12)
+        self.pack2(right, resize=True, shrink=False)
+        self.version_actions = []
+
+        self.heading = Gtk.Label(xalign=0)
+        right.pack_start(self.heading, False, False, 0)
+
+        row = Gtk.Box(spacing=8)
+        for text, handler, style in (
+            ("Make CLI default", self.on_use_cli, None),
+            ("Use for Apache mod_php", self.on_use_apache, None),
+            ("Remove…", self.on_remove, "destructive-action"),
+        ):
+            widget = button(text, handler, style)
+            row.pack_start(widget, False, False, 0)
+            self.version_actions.append(widget)
+        right.pack_start(row, False, False, 0)
+
+        row = Gtk.Box(spacing=8)
+        row.pack_start(label("FPM service:"), False, False, 0)
+        for action in ("start", "stop", "restart"):
+            widget = button(action.capitalize(), lambda _w, a=action: self.on_fpm(a))
+            row.pack_start(widget, False, False, 0)
+            self.version_actions.append(widget)
+        right.pack_start(row, False, False, 0)
+
+        right.pack_start(label("<b>Extensions</b>  (select one or more)", use_markup=True), False, False, 0)
+        self.exts = Gtk.ListStore(str, str, str, str)
+        self.ext_tree = Gtk.TreeView(model=self.exts)
+        for i, title in enumerate(("Module", "CLI", "FPM", "Apache")):
+            self.ext_tree.append_column(Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=i))
+        self.ext_tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        right.pack_start(scrolled(self.ext_tree, height=200), True, True, 0)
+
+        row = Gtk.Box(spacing=8)
+        row.pack_start(label("Apply to:"), False, False, 0)
+        self.sapi_cli = Gtk.CheckButton(label="CLI", active=True)
+        self.sapi_fpm = Gtk.CheckButton(label="FPM", active=True)
+        self.sapi_apache = Gtk.CheckButton(label="Apache", active=True)
+        for widget in (self.sapi_cli, self.sapi_fpm, self.sapi_apache):
+            row.pack_start(widget, False, False, 0)
+        self.restart_after = Gtk.CheckButton(label="Restart FPM / reload Apache afterwards", active=True)
+        row.pack_start(self.restart_after, False, False, 12)
+        right.pack_start(row, False, False, 0)
+
+        row = Gtk.Box(spacing=8)
+        for text, handler in (("Enable selected", lambda *_: self.on_toggle_ext("enable")),
+                              ("Disable selected", lambda *_: self.on_toggle_ext("disable"))):
+            widget = button(text, handler)
+            row.pack_start(widget, False, False, 0)
+            self.version_actions.append(widget)
+        right.pack_start(row, False, False, 0)
+
+        row = Gtk.Box(spacing=8)
+        self.packages = Gtk.Entry(hexpand=True, placeholder_text="Packages, e.g. intl xdebug redis")
+        row.pack_start(self.packages, True, True, 0)
+        for text, handler, style in (
+            ("Install", self.on_pkg_install, None),
+            ("Remove…", self.on_pkg_remove, "destructive-action"),
+            ("Search", self.on_pkg_search, None),
+            ("Sync from file", self.on_pkg_sync, None),
+        ):
+            widget = button(text, handler, style)
+            row.pack_start(widget, False, False, 0)
+            self.version_actions.append(widget)
+        right.pack_start(row, False, False, 0)
+
+        self.select_version(None)
+        self.refresh()
+
+    def on_shown(self):
+        pass
+
+    # ----- data -----
+
+    def refresh(self):
+        select = self.version
+        self.runner.capture(self.phpmgr, ["list", "--porcelain"],
+                            lambda code, out: self.fill_versions(code, out, select))
+
+    def fill_versions(self, code, out, select):
+        self.versions.clear()
+        if code != 0:
+            self.runner.log("❌ Could not list PHP versions:\n%s" % out)
+            return
+        target = None
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 6:
+                continue
+            ver, full, cli, apache, fpm, _alt = parts
+            it = self.versions.append([
+                ver,
+                full,
+                "● default" if cli == "active" else "",
+                {"active": "● active", "ready": "installed"}.get(apache, ""),
+                {"running": "● running", "stopped": "stopped"}.get(fpm, ""),
+            ])
+            if ver == select:
+                target = it
+        if target is not None:
+            self.version_tree.get_selection().select_iter(target)
+        else:
+            self.select_version(None)
+
+    def load_exts(self):
+        self.exts.clear()
+        if self.version:
+            ver = self.version
+            self.runner.capture(self.phpmgr, ["ext", "list", ver, "--porcelain"],
+                                lambda code, out: self.fill_exts(code, out, ver))
+
+    def fill_exts(self, code, out, ver):
+        if ver != self.version:
+            return
+        self.exts.clear()
+        if code != 0:
+            self.runner.log("❌ Could not list extensions for PHP %s:\n%s" % (ver, out))
+            return
+        marks = {"y": "✔", "n": "—", "-": ""}
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 4:
+                self.exts.append([parts[0]] + [marks.get(p, p) for p in parts[1:]])
+
+    def on_select(self, selection):
+        model, it = selection.get_selected()
+        self.select_version(model[it][0] if it is not None else None)
+
+    def select_version(self, ver):
+        changed = ver != self.version
+        self.version = ver
+        for widget in self.version_actions:
+            widget.set_sensitive(ver is not None)
+        if ver:
+            self.heading.set_markup("<b>PHP %s</b>" % ver)
+        else:
+            self.heading.set_markup("<i>Select a PHP version</i>")
+        if changed or not ver:
+            self.load_exts()
+
+    def after(self, code=None):
+        self.refresh()
+        self.load_exts()
+
+    # ----- actions -----
+
+    def on_install(self, *_):
+        ver = self.new_version.get_text().strip()
+        if not VERSION_RE.match(ver):
+            self.runner.log("❌ Enter a version like 8.4\n")
+            return
+        args = ["--no-prompt"]
+        for check, key in ((self.opt_mod_php, "mod-php"), (self.opt_ext_file, "ext-file"),
+                           (self.opt_cli, "use-cli"), (self.opt_apache, "use-apache")):
+            if check.get_active():
+                args += ["--yes", key]
+        self.runner.run(self.phpmgr, args + ["install", ver], privileged=True, on_done=self.after)
+
+    def on_use_cli(self, *_):
+        self.runner.run(self.phpmgr, ["--no-prompt", "use", self.version, "--cli"],
+                        privileged=True, on_done=self.after)
+
+    def on_use_apache(self, *_):
+        ok, _ = confirm(
+            self.window,
+            "Switch Apache mod_php to PHP %s?" % self.version,
+            "Every site set to “mod_php” will run on PHP %s. Sites using PHP-FPM are not affected. "
+            "Apache is restarted." % self.version,
+            "Switch",
+        )
+        if ok:
+            self.runner.run(self.phpmgr,
+                            ["--no-prompt", "--yes", "install-mod-php", "apache", "use", self.version],
+                            privileged=True, on_done=self.after)
+
+    def on_remove(self, *_):
+        ok, _ = confirm(
+            self.window,
+            "Remove PHP %s?" % self.version,
+            "Removes all php%s packages. Sites using PHP-FPM %s will stop running PHP."
+            % (self.version, self.version),
+            "Remove",
+        )
+        if ok:
+            self.runner.run(self.phpmgr, ["--yes", "remove", "remove", self.version],
+                            privileged=True, on_done=self.after)
+
+    def on_fpm(self, action):
+        self.runner.run(self.phpmgr, ["fpm", action, self.version], privileged=True, on_done=self.after)
+
+    def selected_modules(self):
+        model, paths = self.ext_tree.get_selection().get_selected_rows()
+        return [model[path][0] for path in paths]
+
+    def on_toggle_ext(self, action):
+        modules = self.selected_modules()
+        if not modules:
+            self.runner.log("❌ Select one or more extensions first.\n")
+            return
+        sapis = [name for check, name in ((self.sapi_cli, "cli"), (self.sapi_fpm, "fpm"),
+                                          (self.sapi_apache, "apache2")) if check.get_active()]
+        if not sapis:
+            self.runner.log("❌ Tick at least one of CLI / FPM / Apache.\n")
+            return
+        args = ["--no-prompt", "--sapi", ",".join(sapis)]
+        if self.restart_after.get_active():
+            args += ["--yes", "restart-fpm", "--yes", "reload-apache"]
+        self.runner.run(self.phpmgr, args + ["ext", action, self.version] + modules,
+                        privileged=True, on_done=self.after)
+
+    def package_names(self):
+        names = self.packages.get_text().split()
+        bad = [name for name in names if not PACKAGE_RE.match(name)]
+        if not names or bad:
+            self.runner.log("❌ Enter extension package names, e.g. intl xdebug%s\n"
+                            % (" (invalid: %s)" % " ".join(bad) if bad else ""))
+            return None
+        return names
+
+    def on_pkg_install(self, *_):
+        names = self.package_names()
+        if names:
+            self.runner.run(self.phpmgr, ["--no-prompt", "ext", "install", self.version] + names,
+                            privileged=True, on_done=self.after)
+
+    def on_pkg_remove(self, *_):
+        names = self.package_names()
+        if not names:
+            return
+        ok, _ = confirm(self.window, "Remove %s?" % ", ".join("php%s-%s" % (self.version, n) for n in names),
+                        "The packages are uninstalled with apt.", "Remove")
+        if ok:
+            self.runner.run(self.phpmgr, ["--no-prompt", "ext", "remove", self.version] + names,
+                            privileged=True, on_done=self.after)
+
+    def on_pkg_search(self, *_):
+        term = self.packages.get_text().strip().split()
+        if not term:
+            self.runner.log("❌ Type a search term in the packages box.\n")
+            return
+        self.runner.run(self.phpmgr, ["ext", "search", self.version, term[0]])
+
+    def on_pkg_sync(self, *_):
+        self.runner.run(self.phpmgr, ["--no-prompt", "ext", "sync", self.version],
+                        privileged=True, on_done=self.after)
+
+
+# ---------- SSL tab (localssl) ----------
+
+class SslPage(Gtk.Paned):
+    def __init__(self, window, runner, localssl):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
+        self.window = window
+        self.runner = runner
+        self.localssl = localssl
+
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        left.set_border_width(6)
+        bar = Gtk.Box(spacing=6)
+        bar.pack_start(label("<b>Certificates</b>", use_markup=True), False, False, 0)
+        refresh = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        refresh.set_tooltip_text("Reload")
+        refresh.connect("clicked", lambda *_: self.refresh())
+        bar.pack_end(refresh, False, False, 0)
+        left.pack_start(bar, False, False, 0)
+
+        self.store = Gtk.ListStore(str, str)
+        tree = Gtk.TreeView(model=self.store)
+        tree.append_column(Gtk.TreeViewColumn("Domain", Gtk.CellRendererText(), text=0))
+        tree.append_column(Gtk.TreeViewColumn("Expires", Gtk.CellRendererText(), text=1))
+        tree.get_selection().connect("changed", self.on_select)
+        left.pack_start(scrolled(tree, width=380), True, True, 0)
+        self.pack1(left, resize=False, shrink=False)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        right.set_border_width(12)
+        self.pack2(right, resize=True, shrink=False)
+
+        note = label(
+            "For sites made on the Sites tab, HTTPS is handled there. Use this tab for "
+            "domains whose vhost localssl manages on its own.",
+            wrap=True,
+        )
+        note.get_style_context().add_class("dim-label")
+        right.pack_start(note, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=8, row_spacing=8)
+        right.pack_start(grid, False, False, 0)
+        grid.attach(label("Domain"), 0, 0, 1, 1)
+        self.domain = Gtk.Entry(hexpand=True, placeholder_text="smartwoo.local")
+        self.domain.connect("changed", self.on_domain_changed)
+        self.domain.connect("activate", lambda *_: self.on_status())
+        grid.attach(self.domain, 1, 0, 2, 1)
+        grid.attach(label("Document root"), 0, 1, 1, 1)
+        self.docroot = Gtk.Entry(hexpand=True)
+        self.docroot.set_tooltip_text("Optional. Must resolve inside %s/. Used by Install and Reinstall." % BASE_WWW)
+        grid.attach(self.docroot, 1, 1, 1, 1)
+        grid.attach(button("Browse…", lambda *_: pick_folder(self.window, self.docroot)), 2, 1, 1, 1)
+        self.force = Gtk.CheckButton(
+            label="Force: regenerate an existing certificate and create a missing document root"
+        )
+        grid.attach(self.force, 1, 2, 2, 1)
+
+        row = Gtk.Box(spacing=8)
+        right.pack_start(row, False, False, 0)
+        for text, handler, style in (
+            ("Install", self.on_install, "suggested-action"),
+            ("Reinstall", self.on_reinstall, None),
+            ("Uninstall", self.on_uninstall, "destructive-action"),
+            ("Status", lambda *_: self.on_status(), None),
+        ):
+            row.pack_start(button(text, handler, style), False, False, 0)
+
+        self.on_domain_changed(self.domain)
+        self.refresh()
+
+    def on_shown(self):
+        self.refresh()
+
+    def refresh(self):
+        self.runner.capture(self.localssl, ["list"], self.fill)
+
+    def fill(self, code, out):
+        self.store.clear()
+        if code != 0:
+            self.runner.log("❌ Could not list certificates:\n%s" % out)
+            return
+        for line in out.splitlines():
+            match = SSL_LIST_ROW_RE.match(line)
+            if match:
+                self.store.append([match.group(1), match.group(2)])
+
+    def get_domain(self):
+        domain = self.domain.get_text().strip()
+        if not DOMAIN_RE.match(domain):
+            self.runner.log("❌ Invalid domain: %s\n" % (domain or "(empty)"))
+            return None
+        return domain
+
+    def docroot_args(self):
+        docroot = self.docroot.get_text().strip()
+        return ["--docroot", docroot] if docroot else []
+
+    def on_domain_changed(self, entry):
+        domain = entry.get_text().strip() or "<domain>"
+        self.docroot.set_placeholder_text("%s/html/%s (default)" % (BASE_WWW, domain))
+
+    def on_select(self, selection):
+        model, it = selection.get_selected()
+        if it is not None:
+            self.domain.set_text(model[it][0])
+            self.on_status()
+
+    def on_status(self):
+        domain = self.get_domain()
+        if domain:
+            self.runner.run(self.localssl, ["status", "--domain", domain])
+
+    def on_install(self, *_):
+        domain = self.get_domain()
+        if domain:
+            args = ["install", "--domain", domain] + self.docroot_args()
+            if self.force.get_active():
+                args.append("--force")
+            self.runner.run(self.localssl, args, privileged=True, on_done=lambda code: self.refresh())
+
+    def on_reinstall(self, *_):
+        domain = self.get_domain()
+        if not domain:
+            return
+        ok, _ = confirm(self.window, "Reinstall SSL for %s?" % domain,
+                        "The certificate, SSL vhost block and hosts entry will be removed and regenerated.",
+                        "Reinstall")
+        if ok:
+            # reinstall skips the uninstall prompt itself; --force only affects the install half.
+            args = ["reinstall", "--domain", domain] + self.docroot_args()
+            if self.force.get_active():
+                args.append("--force")
+            self.runner.run(self.localssl, args, privileged=True, on_done=lambda code: self.refresh())
+
+    def on_uninstall(self, *_):
+        domain = self.get_domain()
+        if not domain:
+            return
+        ok, _ = confirm(self.window, "Uninstall SSL for %s?" % domain,
+                        "This removes the certificate, the SSL (:443) vhost block and the /etc/hosts entry.",
+                        "Uninstall")
+        if ok:
+            self.runner.run(self.localssl, ["uninstall", "--domain", domain, "--force"],
+                            privileged=True, on_done=lambda code: self.refresh())
+
+
+# ---------- main window ----------
+
+class ManagerWindow(Gtk.Window):
+    def __init__(self, tools):
+        super().__init__(title="Callismart Dev Manager")
+        self.set_default_size(1100, 720)
+
+        header = Gtk.HeaderBar(show_close_button=True)
+        self.set_titlebar(header)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        switcher = Gtk.StackSwitcher(stack=self.stack)
+        header.set_custom_title(switcher)
+        self.spinner = Gtk.Spinner()
+        header.pack_end(self.spinner)
+
+        # Shared output log
+        log_view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True,
+                                wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        log_view.set_left_margin(6)
+        log_view.set_right_margin(6)
+        self.runner = Runner(log_view, self.set_busy)
+
+        log_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        log_box.set_border_width(6)
+        log_bar = Gtk.Box(spacing=6)
+        log_bar.pack_start(label("<b>Output</b>", use_markup=True), False, False, 0)
+        log_bar.pack_end(button("Clear", lambda *_: log_view.get_buffer().set_text("")), False, False, 0)
+        log_box.pack_start(log_bar, False, False, 0)
+        frame = Gtk.Frame()
+        frame.add(scrolled(log_view))
+        log_box.pack_start(frame, True, True, 0)
+
+        pages = (
+            ("sites", "Sites", "sitemgr", SitesPage),
+            ("php", "PHP", "phpmgr", PhpPage),
+            ("ssl", "SSL", "localssl", SslPage),
+        )
+        for name, title, tool, page_class in pages:
+            path = tools.get(tool)
+            if path:
+                page = page_class(self, self.runner, path)
+            else:
+                page = label("  %s was not found. Install it to /usr/local/bin/%s." % (tool, tool))
+            self.stack.add_titled(page, name, title)
+        self.stack.connect("notify::visible-child", self.on_page_changed)
+
+        paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        paned.pack1(self.stack, resize=True, shrink=False)
+        paned.pack2(log_box, resize=False, shrink=False)
+        paned.set_position(470)
+        self.add(paned)
+
+    def set_busy(self, busy):
+        self.stack.set_sensitive(not busy)
+        if busy:
+            self.spinner.start()
+        else:
+            self.spinner.stop()
+
+    def on_page_changed(self, stack, _param):
+        page = stack.get_visible_child()
+        if hasattr(page, "on_shown"):
+            page.on_shown()
+
+
+def main():
+    tools = {
+        "sitemgr": find_tool("SITEMGR_BIN", ["sitemgr"]),
+        "phpmgr": find_tool("PHPMGR_BIN", ["phpmgr"]),
+        "localssl": find_tool("LOCALSSL_BIN", ["localssl", "callismart-ssl"]),
+    }
+    if not any(tools.values()):
+        dialog = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.CLOSE,
+            text="No tools found",
+        )
+        dialog.format_secondary_text("Install sitemgr, phpmgr and localssl to /usr/local/bin.")
+        dialog.run()
+        return 1
+
+    win = ManagerWindow(tools)
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Callismart Dev Manager
+Comment=Manage local Apache sites, PHP versions and SSL certificates
+Exec=callismart-devmgr
+Icon=network-server
+Terminal=false
+Categories=Development;Utility;
+Keywords=apache;vhost;php;fpm;ssl;https;mkcert;domain;

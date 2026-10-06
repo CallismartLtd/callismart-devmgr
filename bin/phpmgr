@@ -1,0 +1,2072 @@
+#!/bin/bash
+# phpmgr — Callismart Tech PHP Manager
+# A nvm-style PHP version & extension manager for Debian/Ubuntu systems.
+
+set -e
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Constants                                                       │
+# └─────────────────────────────────────────────────────────────────┘
+
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_VERSION="2.3.0"
+
+# Home of the person who invoked phpmgr, even when it runs as root through
+# sudo or pkexec (the desktop GUI), so the extensions file is theirs.
+function _invoking_user_home() {
+    if [ -n "${PKEXEC_UID:-}" ]; then
+        getent passwd "$PKEXEC_UID" | cut -d: -f6
+    elif [ -n "${SUDO_USER:-}" ]; then
+        getent passwd "$SUDO_USER" | cut -d: -f6
+    else
+        echo "$HOME"
+    fi
+}
+
+EXT_FILE="${PHPMGR_EXT_FILE:-$(_invoking_user_home)/.phpmgr/extensions.txt}"
+PHPMGR_REMOTE_CACHE="${TMPDIR:-/tmp}/.phpmgr_remote_cache"
+PHPMGR_REMOTE_CACHE_TTL=3600   # seconds before re-fetching
+
+# Non-interactive mode (set by --no-prompt / --yes, see entry point).
+# Every yes/no prompt has a key; in this mode a prompt answers "yes" only
+# when its key was passed with --yes, otherwise "no".
+NONINTERACTIVE=0
+declare -A ASSUME_YES=()
+SAPI_LIST=""   # --sapi cli,fpm,apache2 — answers the SAPI selection prompt
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  ANSI colour / style definitions                                 │
+# │  Disabled when stdout is not a terminal or NO_COLOR is set.     │
+# └─────────────────────────────────────────────────────────────────┘
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    RESET=$'\033[0m'
+    BOLD=$'\033[1m'
+    DIM=$'\033[2m'
+    ITALIC=$'\033[3m'
+
+    BLACK=$'\033[30m'
+    RED=$'\033[31m'
+    GREEN=$'\033[32m'
+    YELLOW=$'\033[33m'
+    BLUE=$'\033[34m'
+    MAGENTA=$'\033[35m'
+    CYAN=$'\033[36m'
+    WHITE=$'\033[37m'
+
+    BG_BLUE=$'\033[44m'
+    BG_CYAN=$'\033[46m'
+    BG_BLACK=$'\033[40m'
+else
+    RESET="" BOLD="" DIM="" ITALIC=""
+    BLACK="" RED="" GREEN="" YELLOW="" BLUE="" MAGENTA="" CYAN="" WHITE=""
+    BG_BLUE="" BG_CYAN="" BG_BLACK=""
+fi
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  UI primitives                                                   │
+# └─────────────────────────────────────────────────────────────────┘
+
+TERM_WIDTH=72
+
+function ui_line() {
+    local i
+    for (( i=0; i<TERM_WIDTH; i++ )); do
+        printf "%s" "${DIM}${BLUE}─${RESET}"
+    done
+    echo ""
+}
+
+function ui_thin_line() {
+    local i
+    for (( i=0; i<TERM_WIDTH; i++ )); do
+        printf "%s" "${DIM}─${RESET}"
+    done
+    echo ""
+}
+
+function ui_blank() { echo ""; }
+
+function ui_header() {
+    ui_blank
+    printf "  %s%s%s  phpmgr  %s%s%s  %s  %s%sv%s%s\n" \
+        "$BOLD" "$BG_BLUE" "$WHITE" \
+        "$RESET" "$DIM$BG_BLACK" "$CYAN" \
+        "Callismart Tech PHP Manager" \
+        "$RESET$DIM" "$GREEN" "$SCRIPT_VERSION" "$RESET"
+    ui_blank
+    ui_line
+}
+
+function ui_section() {
+    ui_blank
+    printf "  %s%s▸ %s%s%s\n" "$BOLD" "$CYAN" "$WHITE" "$1" "$RESET"
+    ui_blank
+}
+
+function ui_subsection() {
+    printf "  %s%s· %s%s%s\n" "$DIM" "$BLUE" "$WHITE" "$1" "$RESET"
+    ui_blank
+}
+
+function ui_success() { printf "  %s✔%s  %s\n"             "$GREEN"  "$RESET" "$1"; }
+function ui_warn()    { printf "  %s⚠%s  %s\n"             "$YELLOW" "$RESET" "$1"; }
+function ui_error()   { printf "  %s✖%s  %s%s%s\n"         "$RED"    "$RESET" "$BOLD" "$1" "$RESET"; }
+function ui_info()    { printf "  %s·%s  %s%s%s\n"          "$CYAN"   "$RESET" "$DIM" "$1" "$RESET"; }
+function ui_step()    { printf "  %s→%s  %s\n"              "$BLUE"   "$RESET" "$1"; }
+function ui_tag()     { printf "  %s%s%-10s%s %s\n"         "$BOLD" "$CYAN" "$1" "$RESET" "$2"; }
+function ui_kv()      { printf "  %s%-20s%s %s\n"           "$DIM" "$1:" "$RESET" "$2"; }
+
+function ui_badge() {
+    # ui_badge LABEL COLOR TEXT
+    printf "%s%s %s %s%s" "$BOLD" "$2" "$1" "$RESET" "$3"
+}
+
+function ui_prompt() {
+    printf "  %s%s?  %s%s%s " "$BOLD" "$YELLOW" "$RESET" "$BOLD" "$1"
+    printf "%s" "$RESET"
+}
+
+function ui_footer() {
+    ui_blank
+    ui_line
+    printf "  %s%s%s\n" "$DIM" "Extensions file: ${EXT_FILE}" "$RESET"
+    ui_blank
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Spinner                                                         │
+# └─────────────────────────────────────────────────────────────────┘
+
+SPINNER_PID=""
+
+function spinner_start() {
+    # \r-redrawn frames are noise in a pipe or log window
+    [ -t 1 ] || return 0
+    local msg="${1:-Working...}"
+    local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+    (
+        local i=0
+        while true; do
+            printf "\r  %s%s%s  %s " "$CYAN" "${frames[$((i % ${#frames[@]}))]}" "$RESET" "$msg"
+            sleep 0.08
+            (( i++ )) || true
+        done
+    ) &
+    SPINNER_PID=$!
+    disown "$SPINNER_PID"
+}
+
+function spinner_stop() {
+    if [ -n "${SPINNER_PID:-}" ]; then
+        kill "$SPINNER_PID" 2>/dev/null || true
+        SPINNER_PID=""
+        printf "\r%-${TERM_WIDTH}s\r" " "
+    fi
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Helpers                                                         │
+# └─────────────────────────────────────────────────────────────────┘
+
+function ask() {
+    # Usage: ask "Question?" [answer-key]
+    local key="${2:-}"
+    ui_prompt "$1 (y/n):"
+    if [ "$NONINTERACTIVE" -eq 1 ]; then
+        if [ -n "$key" ] && [ -n "${ASSUME_YES[$key]:-}" ]; then
+            echo "y  (--yes ${key})"
+            return 0
+        fi
+        echo "n${key:+  (pass --yes ${key} to answer yes)}"
+        return 1
+    fi
+    read -r -s -n 1 choice
+    echo ""
+    case "$choice" in
+        y|Y ) return 0 ;;
+        * ) return 1 ;;
+    esac
+}
+
+function pause() {
+    [ "$NONINTERACTIVE" -eq 1 ] && return 0
+    ui_blank
+    ui_prompt "Press any key to continue..."
+    read -r -s -n 1
+    echo ""
+}
+
+function run_apt() {
+    # Usage: run_apt "Label" <apt command and args...>
+    local label="$1"; shift
+    local start_ts rc
+
+    start_ts=$(date +%s)
+    ui_step "$label"
+
+    # Stream apt output indented, stripping noisy bookkeeping lines
+    sudo "$@" 2>&1 \
+        | grep -v -E \
+            "^$|^Hit:|^Get:|^Fetched|^Reading package|^Building dep|^Calculating|^Selecting|^Preparing|^Unpacking|^Setting up|^Processing|^update-alternatives|^\(Reading database" \
+        | while IFS= read -r line; do printf "    %s\n" "$line"; done
+    rc=${PIPESTATUS[0]}
+
+    local elapsed=$(( $(date +%s) - start_ts ))
+    if [ "$rc" -eq 0 ]; then
+        ui_success "${label} — done in ${elapsed}s"
+    else
+        ui_error "${label} — failed after ${elapsed}s (exit ${rc})"
+    fi
+
+    cache_invalidate
+    return "$rc"
+}
+
+function require_version_arg() {
+    if [ -z "${1:-}" ]; then
+        ui_error "PHP version required. Example: $SCRIPT_NAME $2 8.3"
+        exit 1
+    fi
+}
+
+function require_installed() {
+    local ver="$1"
+    if [ ! -f "/usr/bin/php${ver}" ]; then
+        ui_error "PHP ${ver} is not installed. Run: $SCRIPT_NAME install ${ver}"
+        exit 1
+    fi
+}
+
+function is_valid_version() {
+    [[ "$1" =~ ^[0-9]+\.[0-9]+$ ]]
+}
+
+function have_apache() {
+    command -v a2enmod > /dev/null 2>&1
+}
+
+function have_curl() {
+    command -v curl > /dev/null 2>&1
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Session-scoped caches                                           │
+# │  Populated once per phpmgr run; cleared by cache_invalidate()   │
+# └─────────────────────────────────────────────────────────────────┘
+
+_CACHE_DPKG=""
+_CACHE_SYSTEMCTL=""
+_CACHE_ALT_LIST=""
+
+function cache_dpkg() {
+    [ -z "$_CACHE_DPKG" ] && _CACHE_DPKG=$(dpkg -l 2>/dev/null)
+    echo "$_CACHE_DPKG"
+}
+
+function cache_systemctl() {
+    [ -z "$_CACHE_SYSTEMCTL" ] && \
+        _CACHE_SYSTEMCTL=$(systemctl list-units --type=service --all 2>/dev/null)
+    echo "$_CACHE_SYSTEMCTL"
+}
+
+function cache_alt_list() {
+    [ -z "$_CACHE_ALT_LIST" ] && \
+        _CACHE_ALT_LIST=$(update-alternatives --list php 2>/dev/null || true)
+    echo "$_CACHE_ALT_LIST"
+}
+
+# Call after any apt install/remove or alternatives change
+function cache_invalidate() {
+    _CACHE_DPKG=""
+    _CACHE_SYSTEMCTL=""
+    _CACHE_ALT_LIST=""
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  PHP version detection                                           │
+# └─────────────────────────────────────────────────────────────────┘
+
+function get_cli_php_version() {
+    php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || echo ""
+}
+
+function get_cli_php_full_version() {
+    php -r 'echo PHP_VERSION;' 2>/dev/null || echo "not available"
+}
+
+function get_apache_php_version() {
+    local mod_file
+    mod_file=$(ls /etc/apache2/mods-enabled/php*.load 2>/dev/null | head -1)
+    if [ -n "$mod_file" ]; then
+        basename "$mod_file" | grep -oE "[0-9]+\.[0-9]+"
+    fi
+}
+
+function get_fpm_active_versions() {
+    # Returns newline-separated list of running FPM versions
+    systemctl list-units --type=service --state=running 2>/dev/null \
+        | grep -oE "php[0-9]+\.[0-9]+-fpm" \
+        | grep -oE "[0-9]+\.[0-9]+" \
+        || true
+}
+
+function get_fpm_enabled_versions() {
+    # All FPM services that exist (running or not) — uses session cache
+    cache_systemctl \
+        | grep -oE "php[0-9]+\.[0-9]+-fpm" \
+        | grep -oE "[0-9]+\.[0-9]+" \
+        || true
+}
+
+function get_all_installed_versions() {
+    for bin in /usr/bin/php[0-9]*.[0-9]*; do
+        [ -f "$bin" ] || continue
+        basename "$bin" | sed 's/php//'
+    done
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  cmd: version                                                    │
+# │  Show CLI, Apache, and FPM version info                         │
+# └─────────────────────────────────────────────────────────────────┘
+
+function cmd_version() {
+    local mode="${1:-all}"   # all | cli | apache | fpm
+
+    # Non-interactive fast output (no header) if not terminal-wide context
+    local show_header=true
+    [ "$mode" = "cli" ] || [ "$mode" = "apache" ] || [ "$mode" = "fpm" ] && show_header=false
+
+    if [ "$show_header" = "true" ]; then
+        ui_header
+        ui_section "PHP Version Status"
+    fi
+
+    case "$mode" in
+        cli )
+            local v
+            v=$(get_cli_php_full_version)
+            echo "$v"
+            return 0
+            ;;
+        apache )
+            local v
+            v=$(get_apache_php_version)
+            echo "${v:-not active}"
+            return 0
+            ;;
+        fpm )
+            local running
+            running=$(get_fpm_active_versions)
+            if [ -n "$running" ]; then
+                echo "$running"
+            else
+                echo "none running"
+            fi
+            return 0
+            ;;
+    esac
+
+    # Full detailed display
+    local cli_ver cli_full
+    cli_full=$(get_cli_php_full_version)
+    cli_ver=$(get_cli_php_version)
+
+    printf "  %sCLI%s\n" "$BOLD" "$RESET"
+    ui_blank
+    if [ -n "$cli_full" ]; then
+        ui_kv "  Active version" "${BOLD}${GREEN}${cli_full}${RESET}"
+        local cli_bin
+        cli_bin=$(which php 2>/dev/null || echo "not found")
+        ui_kv "  Binary" "$cli_bin"
+        # Show linked version from alternatives
+        local alt_target
+        alt_target=$(update-alternatives --query php 2>/dev/null | awk '/^Value:/{print $2}' || echo "")
+        [ -n "$alt_target" ] && ui_kv "  Alternatives link" "$alt_target"
+    else
+        ui_warn "PHP CLI not found or not in PATH."
+    fi
+
+    ui_blank
+    printf "  %sApache SAPI%s\n" "$BOLD" "$RESET"
+    ui_blank
+    if have_apache; then
+        local apache_ver
+        apache_ver=$(get_apache_php_version)
+        if [ -n "$apache_ver" ]; then
+            ui_kv "  Active mod_php" "${BOLD}${GREEN}PHP ${apache_ver}${RESET}"
+            # Full version from binary
+            local apache_full
+            apache_full=$("/usr/bin/php${apache_ver}" -r 'echo PHP_VERSION;' 2>/dev/null || echo "")
+            [ -n "$apache_full" ] && ui_kv "  Full version" "$apache_full"
+        else
+            ui_kv "  Active mod_php" "${DIM}not active${RESET}"
+        fi
+        # Show all installed Apache SAPI mods
+        local installed_mods
+        installed_mods=$(ls /usr/lib/apache2/modules/libphp*.so 2>/dev/null \
+            | sed 's|.*libphp||;s|\.so||' | tr '\n' ' ' || echo "")
+        [ -n "$installed_mods" ] && ui_kv "  Installed mods" "$installed_mods"
+    else
+        ui_kv "  Apache2" "${DIM}not detected${RESET}"
+    fi
+
+    ui_blank
+    printf "  %sPHP-FPM%s\n" "$BOLD" "$RESET"
+    ui_blank
+    local all_fpm
+    all_fpm=$(get_fpm_enabled_versions)
+    if [ -n "$all_fpm" ]; then
+        local running_fpm
+        running_fpm=$(get_fpm_active_versions)
+        while IFS= read -r fver; do
+            [ -z "$fver" ] && continue
+            if echo "$running_fpm" | grep -q "^${fver}$"; then
+                local fpm_full
+                fpm_full=$("/usr/bin/php${fver}" -r 'echo PHP_VERSION;' 2>/dev/null || echo "")
+                ui_kv "  PHP ${fver} FPM" "${GREEN}${BOLD}running${RESET}  ${DIM}(${fpm_full})${RESET}"
+            else
+                ui_kv "  PHP ${fver} FPM" "${DIM}stopped${RESET}"
+            fi
+        done <<< "$all_fpm"
+    else
+        ui_kv "  Status" "${DIM}no FPM services found${RESET}"
+    fi
+
+    ui_blank
+    ui_line
+    ui_blank
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  cmd: list (local)                                              │
+# └─────────────────────────────────────────────────────────────────┘
+
+function cmd_list_porcelain() {
+    # One line per installed version, tab-separated:
+    #   version  full  cli(active|-)  apache(active|ready|-)  fpm(running|stopped|-)  alt(yes|no)
+    local active_cli active_apache running_fpm systemctl_snap alt_snap
+    active_cli=$(get_cli_php_version)
+    active_apache=$(get_apache_php_version)
+    running_fpm=$(get_fpm_active_versions)
+    systemctl_snap=$(cache_systemctl)
+    alt_snap=$(cache_alt_list)
+
+    for bin in /usr/bin/php[0-9]*.[0-9]*; do
+        [ -f "$bin" ] || continue
+        local ver full cli apache fpm alt
+        ver=$(basename "$bin" | sed 's/php//')
+        is_valid_version "$ver" || continue
+        full=$("$bin" -r 'echo PHP_VERSION;' 2>/dev/null || echo "?")
+
+        [ "$ver" = "$active_cli" ] && cli="active" || cli="-"
+
+        if [ ! -f "/usr/lib/apache2/modules/libphp${ver}.so" ]; then
+            apache="-"
+        elif [ "$ver" = "$active_apache" ]; then
+            apache="active"
+        else
+            apache="ready"
+        fi
+
+        if echo "$running_fpm" | grep -q "^${ver}$"; then
+            fpm="running"
+        elif echo "$systemctl_snap" | grep -q "php${ver}-fpm"; then
+            fpm="stopped"
+        else
+            fpm="-"
+        fi
+
+        echo "$alt_snap" | grep -q "/usr/bin/php${ver}" && alt="yes" || alt="no"
+
+        printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$ver" "$full" "$cli" "$apache" "$fpm" "$alt"
+    done
+}
+
+function cmd_list() {
+    if [ "${1:-}" = "--porcelain" ]; then
+        cmd_list_porcelain
+        return
+    fi
+
+    ui_header
+    ui_section "Installed PHP Versions"
+
+    spinner_start "Loading system state..."
+    local active_cli active_apache running_fpm dpkg_snap systemctl_snap alt_snap
+    active_cli=$(get_cli_php_version)
+    active_apache=$(get_apache_php_version)
+    running_fpm=$(get_fpm_active_versions)
+    # Hoist all three expensive calls once
+    dpkg_snap=$(cache_dpkg)
+    systemctl_snap=$(cache_systemctl)
+    alt_snap=$(cache_alt_list)
+    spinner_stop
+
+    # Column widths
+    local c1=22 c2=10 c3=9 c4=13 c5=10 c6=8
+
+    # Header
+    printf "  %s%s%s" "$BOLD" "$BG_CYAN" "$BLACK"
+    printf " %-${c1}s %-${c2}s %-${c3}s %-${c4}s %-${c5}s %-${c6}s" \
+        "Version" "Full" "CLI" "Apache SAPI" "FPM" "Alt."
+    printf "%s\n" "$RESET"
+
+    local found=0
+
+    for bin in /usr/bin/php[0-9]*.[0-9]*; do
+        [ -f "$bin" ] || continue
+        local ver
+        ver=$(basename "$bin" | sed 's/php//')
+        local full_ver
+        full_ver=$("$bin" -r 'echo PHP_VERSION;' 2>/dev/null || echo "?")
+
+        # CLI column
+        local cli_label cli_color
+        if [ "$ver" = "$active_cli" ]; then
+            cli_label="● active"; cli_color="${GREEN}${BOLD}"
+        else
+            cli_label="○"; cli_color="$DIM"
+        fi
+
+        # Apache SAPI column
+        local sapi_label sapi_color
+        if [ ! -f "/usr/lib/apache2/modules/libphp${ver}.so" ]; then
+            sapi_label="—"; sapi_color="$DIM"
+        elif [ "$ver" = "$active_apache" ]; then
+            sapi_label="● active"; sapi_color="${GREEN}${BOLD}"
+        else
+            sapi_label="○ ready"; sapi_color="$YELLOW"
+        fi
+
+        # FPM column — grep the snapshot, no subprocess per iteration
+        local fpm_label fpm_color
+        if echo "$running_fpm" | grep -q "^${ver}$"; then
+            fpm_label="● running"; fpm_color="${GREEN}${BOLD}"
+        elif echo "$systemctl_snap" | grep -q "php${ver}-fpm"; then
+            fpm_label="○ stopped"; fpm_color="$YELLOW"
+        else
+            fpm_label="—"; fpm_color="$DIM"
+        fi
+
+        # Alternatives column — grep the snapshot
+        local alt_label alt_color
+        if echo "$alt_snap" | grep -q "/usr/bin/php${ver}"; then
+            alt_label="yes"; alt_color="$GREEN"
+        else
+            alt_label="no"; alt_color="$DIM"
+        fi
+
+        printf "  %s%-${c1}s%s" "${CYAN}" "PHP ${ver}" "${RESET}"
+        printf " %s%-${c2}s%s" "${DIM}" "${full_ver}" "${RESET}"
+        printf " %s%-${c3}s%s" "${cli_color}" "${cli_label}" "${RESET}"
+        printf " %s%-${c4}s%s" "${sapi_color}" "${sapi_label}" "${RESET}"
+        printf " %s%-${c5}s%s" "${fpm_color}" "${fpm_label}" "${RESET}"
+        printf " %s%-${c6}s%s" "${alt_color}" "${alt_label}" "${RESET}"
+        echo ""
+
+        (( found++ )) || true
+    done
+
+    if [ "$found" -eq 0 ]; then
+        ui_blank
+        ui_warn "No versioned PHP binaries found in /usr/bin."
+        ui_info "Run: $SCRIPT_NAME install <version>   to install a PHP version."
+    else
+        ui_blank
+        ui_info "${found} version(s) installed."
+        printf "  %s● active%s = currently in use   %s○ ready%s = installed, not active\n" \
+            "$GREEN$BOLD" "$RESET$DIM" "$YELLOW" "$RESET"
+    fi
+
+    ui_footer
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  cmd: list-remote                                               │
+# │  Fetch available PHP versions from ondrej/php PPA              │
+# └─────────────────────────────────────────────────────────────────┘
+
+function fetch_remote_versions() {
+    # Try apt-cache first (works if ondrej/php is already added)
+    local versions
+    versions=$(apt-cache search --names-only '^php[0-9]+\.[0-9]+$' 2>/dev/null \
+        | grep -oE "php[0-9]+\.[0-9]+" \
+        | grep -oE "[0-9]+\.[0-9]+" \
+        | sort -V \
+        | uniq)
+
+    if [ -z "$versions" ] && have_curl; then
+        # Fallback: parse the PPA page
+        spinner_start "Fetching remote versions from ondrej/php PPA..."
+        versions=$(curl -fsSL "https://launchpad.net/~ondrej/+archive/ubuntu/php/+packages" 2>/dev/null \
+            | grep -oE "php[0-9]+\.[0-9]+" \
+            | grep -oE "[0-9]+\.[0-9]+" \
+            | sort -V \
+            | uniq)
+        spinner_stop
+    fi
+
+    echo "$versions"
+}
+
+function get_latest_stable_version() {
+    # Latest stable = highest non-RC/alpha from remote list
+    fetch_remote_versions | tail -1
+}
+
+function cmd_list_remote() {
+    ui_header
+    ui_section "Available PHP Versions (ondrej/php PPA)"
+
+    spinner_start "Querying available versions..."
+    local remote_versions
+    remote_versions=$(fetch_remote_versions)
+    spinner_stop
+
+    if [ -z "$remote_versions" ]; then
+        ui_warn "Could not retrieve remote version list."
+        ui_info "Ensure 'ppa:ondrej/php' is added or internet is available."
+        ui_blank
+        return 1
+    fi
+
+    local active_cli
+    active_cli=$(get_cli_php_version)
+
+    # Column widths
+    printf "  %s%s%s" "$BOLD" "$BG_CYAN" "$BLACK"
+    printf " %-12s %-12s %-10s" "Version" "Status" "CLI"
+    printf "%s\n" "$RESET"
+
+    while IFS= read -r ver; do
+        [ -z "$ver" ] && continue
+        local installed_label installed_color
+        if [ -f "/usr/bin/php${ver}" ]; then
+            installed_label="installed"; installed_color="${GREEN}"
+        else
+            installed_label="available"; installed_color="${DIM}"
+        fi
+
+        local cli_label cli_color
+        if [ "$ver" = "$active_cli" ]; then
+            cli_label="● active"; cli_color="${GREEN}${BOLD}"
+        else
+            cli_label=""; cli_color=""
+        fi
+
+        printf "  %sPHP %-8s%s %s%-12s%s %s%-10s%s\n" \
+            "${CYAN}" "$ver" "${RESET}" \
+            "${installed_color}" "$installed_label" "${RESET}" \
+            "${cli_color}" "$cli_label" "${RESET}"
+    done <<< "$remote_versions"
+
+    ui_blank
+    local latest
+    latest=$(echo "$remote_versions" | tail -1)
+    ui_info "Latest available: ${BOLD}${GREEN}PHP ${latest}${RESET}"
+    ui_info "Install any version with: ${BOLD}$SCRIPT_NAME install <version>${RESET}"
+    ui_blank
+    ui_line
+    ui_blank
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  cmd: latest                                                     │
+# └─────────────────────────────────────────────────────────────────┘
+
+function cmd_latest() {
+    spinner_start "Checking latest PHP version..."
+    local latest
+    latest=$(get_latest_stable_version)
+    spinner_stop
+
+    if [ -z "$latest" ]; then
+        ui_error "Could not determine latest PHP version."
+        exit 1
+    fi
+
+    local active_cli
+    active_cli=$(get_cli_php_version)
+
+    printf "  %sLatest available:%s %s%s%s\n" "$DIM" "$RESET" "$BOLD$GREEN" "PHP $latest" "$RESET"
+
+    if [ "$latest" = "$active_cli" ]; then
+        printf "  %s✔  You are already using the latest version.%s\n" "$GREEN" "$RESET"
+    elif [ -f "/usr/bin/php${latest}" ]; then
+        printf "  %s·  PHP %s is installed but not the active CLI version.%s\n" \
+            "$YELLOW" "$latest" "$RESET"
+        printf "  %s·  Run: %s%s use %s%s%s to switch.%s\n" \
+            "$DIM" "$RESET" "$SCRIPT_NAME" "$latest" "$RESET" "$DIM" "$RESET"
+    else
+        printf "  %s·  Not installed. Run: %s%s install %s%s%s to install.%s\n" \
+            "$DIM" "$RESET" "$SCRIPT_NAME" "$latest" "$RESET" "$DIM" "$RESET"
+    fi
+    ui_blank
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  cmd: install                                                    │
+# └─────────────────────────────────────────────────────────────────┘
+
+function cmd_install() {
+    local VERSION="${1:-}"
+
+    ui_header
+    ui_section "Install PHP"
+
+    if [ -z "$VERSION" ]; then
+        ui_prompt "PHP version (e.g. 8.3, 8.4):"
+        read -r VERSION
+        ui_blank
+    fi
+
+    if [ -z "$VERSION" ] || ! is_valid_version "$VERSION"; then
+        ui_error "Invalid or missing PHP version: '${VERSION}'"
+        pause; return 1
+    fi
+
+    run_apt "Updating package index..." apt update
+
+    local packages=("php${VERSION}" "php${VERSION}-cli" "php${VERSION}-fpm")
+
+    for pkg in "${packages[@]}"; do
+        _install_or_reinstall_pkg "$pkg"
+    done
+
+    # Apache SAPI
+    if have_apache; then
+        ui_blank
+        if ask "Install Apache mod_php for PHP ${VERSION}?" mod-php; then
+            _install_or_reinstall_pkg "libapache2-mod-php${VERSION}"
+        fi
+    fi
+
+    ui_blank
+    if ask "Install dev extensions from extensions file?" ext-file; then
+        cmd_ext_install "$VERSION" --from-file
+    fi
+
+    ui_blank
+    if ask "Set PHP ${VERSION} as default CLI?" use-cli; then
+        _do_switch_cli "$VERSION"
+    fi
+
+    ui_blank
+    if have_apache && [ -f "/usr/lib/apache2/modules/libphp${VERSION}.so" ]; then
+        if ask "Switch Apache to PHP ${VERSION}?" use-apache; then
+            _do_switch_apache "$VERSION"
+        fi
+    fi
+
+    ui_blank
+    ui_success "PHP ${VERSION} installation complete."
+    pause
+}
+
+function _install_or_reinstall_pkg() {
+    local pkg="$1"
+    if cache_dpkg | grep -q "^ii  ${pkg} "; then
+        ui_info "${pkg} is already installed."
+        if ask "Reinstall ${pkg}?" reinstall; then
+            if run_apt "Reinstalling ${pkg}..." apt install -y --reinstall "$pkg"; then
+                ui_success "Reinstalled ${pkg}"
+            else
+                ui_warn "Reinstall of ${pkg} failed."
+            fi
+        else
+            ui_warn "Skipped ${pkg}"
+        fi
+    else
+        if run_apt "Installing ${pkg}..." apt install -y "$pkg"; then
+            ui_success "${pkg} installed."
+        else
+            ui_error "Failed to install ${pkg}."
+            ui_info "You may need: sudo add-apt-repository ppa:ondrej/php && sudo apt update"
+            return 1
+        fi
+    fi
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  cmd: remove                                                     │
+# └─────────────────────────────────────────────────────────────────┘
+
+function cmd_remove() {
+    local VERSION="${1:-}"
+    require_version_arg "$VERSION" "remove"
+    require_installed "$VERSION"
+
+    ui_header
+    ui_section "Remove PHP ${VERSION}"
+
+    local active_cli
+    active_cli=$(get_cli_php_version)
+
+    if [ "$VERSION" = "$active_cli" ]; then
+        ui_warn "PHP ${VERSION} is the active CLI version."
+        ui_info "Switch to another version first: $SCRIPT_NAME use <version>"
+    fi
+
+    if ! ask "Remove PHP ${VERSION} and all its packages?" remove; then
+        ui_warn "Aborted."; pause; return
+    fi
+
+    # Gather packages to remove — use dpkg cache
+    local pkgs_to_remove=()
+    while IFS= read -r pkg; do
+        pkgs_to_remove+=( "$pkg" )
+    done < <(cache_dpkg | awk '{print $2}' | grep -E "^php${VERSION}" || true)
+
+    if [ ${#pkgs_to_remove[@]} -eq 0 ]; then
+        ui_warn "No packages found for PHP ${VERSION}."
+        pause; return
+    fi
+
+    ui_step "Packages to remove: ${pkgs_to_remove[*]}"
+    ui_blank
+
+    if run_apt "Removing PHP ${VERSION} packages..." apt remove -y "${pkgs_to_remove[@]}"; then
+        ui_success "PHP ${VERSION} removed."
+    else
+        ui_error "Removal encountered errors. Check logs."
+        pause; return 1
+    fi
+
+    # Remove from alternatives
+    if cache_alt_list | grep -q "/usr/bin/php${VERSION}"; then
+        sudo update-alternatives --remove php "/usr/bin/php${VERSION}" > /dev/null 2>&1 || true
+        cache_invalidate
+        ui_success "Removed from update-alternatives."
+    fi
+
+    ui_blank
+    ui_success "PHP ${VERSION} uninstalled."
+    pause
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Internal switch helpers                                         │
+# └─────────────────────────────────────────────────────────────────┘
+
+function _do_switch_cli() {
+    local VERSION="$1"
+    require_installed "$VERSION"
+
+    if ! cache_alt_list | grep -q "/usr/bin/php${VERSION}"; then
+        ui_step "Registering PHP ${VERSION} in update-alternatives..."
+        sudo update-alternatives --install /usr/bin/php php "/usr/bin/php${VERSION}" 1 \
+            > /dev/null 2>&1
+        sudo update-alternatives --install /usr/bin/phar phar "/usr/bin/phar${VERSION}" 1 \
+            > /dev/null 2>&1 || true
+        sudo update-alternatives --install /usr/bin/phar.phar phar.phar \
+            "/usr/bin/phar.phar${VERSION}" 1 > /dev/null 2>&1 || true
+        cache_invalidate
+        ui_success "Registered."
+    fi
+
+    sudo update-alternatives --set php "/usr/bin/php${VERSION}" > /dev/null 2>&1
+    sudo update-alternatives --set phar "/usr/bin/phar${VERSION}" > /dev/null 2>&1 || true
+    sudo update-alternatives --set phar.phar "/usr/bin/phar.phar${VERSION}" > /dev/null 2>&1 || true
+
+    local active_full
+    active_full=$(php -r 'echo PHP_VERSION;' 2>/dev/null)
+    ui_success "CLI → PHP ${active_full}"
+}
+
+function _do_switch_apache() {
+    local VERSION="$1"
+
+    if ! have_apache; then
+        ui_warn "Apache2 not detected. Skipping SAPI switch."; return 0
+    fi
+
+    if [ ! -f "/usr/lib/apache2/modules/libphp${VERSION}.so" ]; then
+        if ask "libapache2-mod-php${VERSION} not found. Install it?" install-mod-php; then
+            if ! run_apt "Installing Apache SAPI..." apt install -y "libapache2-mod-php${VERSION}"; then
+                ui_error "Failed to install libapache2-mod-php${VERSION}"
+                return 1
+            fi
+            ui_success "Installed libapache2-mod-php${VERSION}"
+        else
+            ui_warn "Skipping Apache SAPI switch."; return 0
+        fi
+    fi
+
+    # Disable all existing PHP modules
+    for mod in /etc/apache2/mods-enabled/php*.load; do
+        [ -e "$mod" ] || continue
+        local ver
+        ver=$(basename "$mod" | grep -oE "[0-9]+\.[0-9]+")
+        sudo a2dismod "php${ver}" > /dev/null 2>&1 || true
+        ui_info "Disabled apache mod php${ver}"
+    done
+
+    if sudo a2enmod "php${VERSION}" > /dev/null 2>&1; then
+        ui_success "Enabled apache mod php${VERSION}"
+    else
+        ui_error "Failed to enable php${VERSION} apache module."
+        return 1
+    fi
+
+    if sudo systemctl restart apache2; then
+        ui_success "Apache restarted."
+    else
+        ui_error "Apache restart failed."; return 1
+    fi
+
+    local active
+    active=$(get_apache_php_version)
+    if [ "$active" = "$VERSION" ]; then
+        ui_success "Apache SAPI → PHP ${VERSION}"
+    else
+        ui_error "Apache SAPI mismatch (expected ${VERSION}, got ${active:-none})"
+    fi
+}
+
+function _do_switch_fpm() {
+    local VERSION="$1"
+
+    if ! cache_systemctl | grep -q "php${VERSION}-fpm"; then
+        if ask "php${VERSION}-fpm service not found. Is php${VERSION}-fpm installed? Start anyway?" fpm-start-anyway; then
+            true
+        else
+            ui_warn "Skipping FPM switch."; return 0
+        fi
+    fi
+
+    # Stop all running FPM versions
+    local running_fpm
+    running_fpm=$(get_fpm_active_versions)
+    while IFS= read -r fver; do
+        [ -z "$fver" ] && continue
+        ui_step "Stopping php${fver}-fpm..."
+        sudo systemctl stop "php${fver}-fpm" > /dev/null 2>&1 || true
+    done <<< "$running_fpm"
+
+    ui_step "Starting php${VERSION}-fpm..."
+    if sudo systemctl start "php${VERSION}-fpm"; then
+        ui_success "php${VERSION}-fpm started."
+    else
+        ui_error "Failed to start php${VERSION}-fpm."
+        return 1
+    fi
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  cmd: use                                                        │
+# │  Switch CLI (and optionally Apache/FPM)                         │
+# └─────────────────────────────────────────────────────────────────┘
+
+function cmd_use() {
+    local VERSION="${1:-}"
+    shift 2>/dev/null || true
+    local force_cli=false force_apache=false force_fpm=false
+
+    # Parse flags: --cli --apache --fpm (defaults to --cli only)
+    if [ $# -eq 0 ]; then
+        force_cli=true
+    fi
+    for flag in "$@"; do
+        case "$flag" in
+            --cli    ) force_cli=true ;;
+            --apache ) force_apache=true ;;
+            --fpm    ) force_fpm=true ;;
+            --all    ) force_cli=true; force_apache=true; force_fpm=true ;;
+        esac
+    done
+    # Default to CLI only if no flags given
+    if ! $force_cli && ! $force_apache && ! $force_fpm; then
+        force_cli=true
+    fi
+
+    if [ -z "$VERSION" ]; then
+        ui_header
+        ui_section "Switch PHP Version"
+        ui_prompt "PHP version:"
+        read -r VERSION
+        ui_blank
+    fi
+
+    if [ -z "$VERSION" ] || ! is_valid_version "$VERSION"; then
+        ui_error "Invalid version: '${VERSION}'"
+        exit 1
+    fi
+
+    require_installed "$VERSION"
+
+    $force_cli    && _do_switch_cli    "$VERSION"
+    $force_apache && _do_switch_apache "$VERSION"
+    $force_fpm    && _do_switch_fpm    "$VERSION"
+
+    # Interactive: offer to switch all if only CLI was done non-interactively
+    if $force_cli && ! $force_apache && ! $force_fpm; then
+        if have_apache && [ -f "/usr/lib/apache2/modules/libphp${VERSION}.so" ]; then
+            ui_blank
+            if ask "Also switch Apache SAPI to PHP ${VERSION}?" also-apache; then
+                _do_switch_apache "$VERSION"
+            fi
+        fi
+    fi
+
+    ui_blank
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  cmd: apache use                                                 │
+# └─────────────────────────────────────────────────────────────────┘
+
+function cmd_apache_use() {
+    local VERSION="${1:-}"
+    require_version_arg "$VERSION" "apache use"
+    require_installed "$VERSION"
+    _do_switch_apache "$VERSION"
+    ui_blank
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  cmd: fpm <action> [version]                                     │
+# └─────────────────────────────────────────────────────────────────┘
+
+function cmd_fpm() {
+    local action="${1:-status}"
+    local VERSION="${2:-}"
+
+    case "$action" in
+        use )
+            require_version_arg "$VERSION" "fpm use"
+            require_installed "$VERSION"
+            _do_switch_fpm "$VERSION"
+            ;;
+        start|stop|restart|reload|status )
+            if [ -n "$VERSION" ]; then
+                local svc="php${VERSION}-fpm"
+                ui_step "${action^} ${svc}..."
+                if sudo systemctl "$action" "$svc"; then
+                    ui_success "${svc} → ${action}"
+                else
+                    ui_error "${action} ${svc} failed."
+                    exit 1
+                fi
+            else
+                # Act on all installed FPM versions
+                local units_snap
+                units_snap=$(cache_systemctl)
+                for ver in $(get_all_installed_versions); do
+                    local svc="php${ver}-fpm"
+                    if echo "$units_snap" | grep -q "${svc}"; then
+                        ui_step "${action^} ${svc}..."
+                        sudo systemctl "$action" "$svc" 2>/dev/null && \
+                            ui_success "${svc} → ${action}" || \
+                            ui_warn "${svc} ${action} failed or not applicable."
+                    fi
+                done
+            fi
+            ;;
+        * )
+            ui_error "Unknown FPM action: '${action}'"
+            ui_info "Usage: $SCRIPT_NAME fpm <start|stop|restart|reload|status|use> [version]"
+            exit 1
+            ;;
+    esac
+    ui_blank
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  cmd: ext — Extension management                                 │
+# │  Subcommands: list, install, remove, enable, disable, search    │
+# └─────────────────────────────────────────────────────────────────┘
+
+function cmd_ext() {
+    local subcmd="${1:-list}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        list    ) cmd_ext_list    "$@" ;;
+        install ) cmd_ext_install "$@" ;;
+        remove  ) cmd_ext_remove  "$@" ;;
+        enable  ) cmd_ext_enable  "$@" ;;
+        disable ) cmd_ext_disable "$@" ;;
+        search  ) cmd_ext_search  "$@" ;;
+        sync    ) cmd_ext_sync "$@" ;;
+        * )
+            ui_error "Unknown ext subcommand: '${subcmd}'"
+            ui_info "Usage: $SCRIPT_NAME ext <list|install|remove|enable|disable|search> [version] [ext...]"
+            exit 1
+            ;;
+    esac
+}
+
+function cmd_ext_list_porcelain() {
+    # One line per module in mods-available, tab-separated:
+    #   module  cli  fpm  apache2      (y = enabled, n = disabled, - = SAPI not installed)
+    local VERSION="$1"
+    local mods_dir="/etc/php/${VERSION}/mods-available"
+
+    if [ ! -d "$mods_dir" ]; then
+        echo "No modules directory for PHP ${VERSION}: ${mods_dir}" >&2
+        return 1
+    fi
+
+    for ini in "$mods_dir"/*.ini; do
+        [ -f "$ini" ] || continue
+        local mod row sapi
+        mod=$(basename "$ini" .ini)
+        row="$mod"
+        for sapi in cli fpm apache2; do
+            if [ ! -d "/etc/php/${VERSION}/${sapi}" ]; then
+                row+=$'\t-'
+            elif compgen -G "/etc/php/${VERSION}/${sapi}/conf.d/*-${mod}.ini" > /dev/null; then
+                row+=$'\ty'
+            else
+                row+=$'\tn'
+            fi
+        done
+        printf "%s\n" "$row"
+    done
+}
+
+function cmd_ext_list() {
+    local VERSION="" porcelain=false arg
+
+    for arg in "$@"; do
+        case "$arg" in
+            --porcelain ) porcelain=true ;;
+            * ) VERSION="$arg" ;;
+        esac
+    done
+
+    if $porcelain; then
+        if ! is_valid_version "$VERSION"; then
+            echo "PHP version required. Usage: $SCRIPT_NAME ext list <version> --porcelain" >&2
+            exit 1
+        fi
+        cmd_ext_list_porcelain "$VERSION"
+        return
+    fi
+
+    if [ -z "$VERSION" ]; then
+        VERSION=$(get_cli_php_version)
+        [ -z "$VERSION" ] && { ui_error "Cannot determine PHP version. Pass it explicitly."; exit 1; }
+    fi
+
+    ui_header
+    ui_section "Extensions for PHP ${VERSION}"
+
+    ui_blank
+    printf "  %s%s%s" "$BOLD" "$BG_CYAN" "$BLACK"
+    printf " %-35s %-12s %-12s" "Extension" "Installed" "Enabled"
+    printf "%s\n" "$RESET"
+
+    # List installed packages for this PHP version — use dpkg cache
+    local count=0
+    local dpkg_snap
+    dpkg_snap=$(cache_dpkg)
+    while IFS= read -r pkg; do
+        [ -z "$pkg" ] && continue
+        local ext_name
+        ext_name="${pkg#php${VERSION}-}"
+
+        # Check if enabled (ini file exists and is not disabled)
+        local enabled_label enabled_color
+        local ini_mods_dir="/etc/php/${VERSION}/mods-available/${ext_name}.ini"
+        local cli_conf="/etc/php/${VERSION}/cli/conf.d"
+        local enabled=false
+        if ls "${cli_conf}/"*"${ext_name}.ini" > /dev/null 2>&1; then
+            enabled=true
+        fi
+
+        if $enabled; then
+            enabled_label="yes"; enabled_color="$GREEN"
+        else
+            enabled_label="no"; enabled_color="$DIM"
+        fi
+
+        printf "  %s%-35s%s %s%-12s%s %s%-12s%s\n" \
+            "$CYAN" "$ext_name" "$RESET" \
+            "$GREEN" "yes" "$RESET" \
+            "${enabled_color}" "$enabled_label" "$RESET"
+
+        (( count++ )) || true
+    done < <(echo "$dpkg_snap" | awk '{print $2}' | grep -E "^php${VERSION}-" | sort || true)
+
+    if [ "$count" -eq 0 ]; then
+        ui_blank
+        ui_warn "No extensions found for PHP ${VERSION}."
+    else
+        ui_blank
+        ui_info "${count} extension package(s) installed for PHP ${VERSION}."
+    fi
+
+    ui_blank
+    # Also show extensions loaded by the PHP binary
+    ui_subsection "Loaded extensions (php -m)"
+    local loaded
+    loaded=$("/usr/bin/php${VERSION}" -m 2>/dev/null | grep -v '^\[' | tr '\n' '  ' || echo "unable to load")
+    printf "  %s%s%s\n" "$DIM" "$loaded" "$RESET"
+    ui_blank
+    ui_line
+    ui_blank
+}
+
+function cmd_ext_search() {
+    local VERSION="${1:-}"; shift 2>/dev/null || true
+    local TERM="${1:-}"
+
+    if [ -z "$VERSION" ] || ! is_valid_version "$VERSION"; then
+        # Maybe they skipped version and just gave a search term
+        TERM="$VERSION"
+        VERSION=$(get_cli_php_version)
+    fi
+
+    if [ -z "$TERM" ]; then
+        ui_prompt "Search extension name/keyword:"
+        read -r TERM
+    fi
+
+    ui_step "Searching extensions matching '${TERM}' for PHP ${VERSION}..."
+    ui_blank
+
+    local results
+    results=$(apt-cache search --names-only "^php${VERSION}-" 2>/dev/null \
+        | grep -i "$TERM" | sort || true)
+
+    if [ -z "$results" ]; then
+        ui_warn "No extensions found matching '${TERM}' for PHP ${VERSION}."
+    else
+        printf "  %s%s%s" "$BOLD" "$BG_CYAN" "$BLACK"
+        printf " %-35s %s" "Package" "Description"
+        printf "%s\n" "$RESET"
+        while IFS= read -r line; do
+            local pkg desc
+            pkg=$(echo "$line" | awk '{print $1}')
+            desc=$(echo "$line" | cut -d' ' -f3-)
+            local installed_marker=""
+            cache_dpkg | grep -q "^ii  ${pkg} " && installed_marker="${GREEN}[installed]${RESET}"
+            printf "  %s%-35s%s %s %s\n" "$CYAN" "$pkg" "$RESET" "$desc" "$installed_marker"
+        done <<< "$results"
+    fi
+
+    ui_blank
+}
+
+function cmd_ext_install() {
+    local VERSION="${1:-}"; shift 2>/dev/null || true
+
+    if [ -z "$VERSION" ] || ! is_valid_version "$VERSION"; then
+        ui_error "PHP version required. Usage: $SCRIPT_NAME ext install <version> <ext...>"
+        exit 1
+    fi
+
+    # Check if --from-file flag
+    local from_file=false
+    local extensions=()
+
+    for arg in "$@"; do
+        if [ "$arg" = "--from-file" ]; then
+            from_file=true
+        else
+            extensions+=("$arg")
+        fi
+    done
+
+    if $from_file; then
+        if [ ! -f "$EXT_FILE" ]; then
+            ui_warn "Extension list not found at ${EXT_FILE}"; return 1
+        fi
+        while read -r ext; do
+            [ -z "$ext" ] && continue
+            extensions+=("$ext")
+        done < "$EXT_FILE"
+    fi
+
+    if [ ${#extensions[@]} -eq 0 ]; then
+        # Interactive mode: prompt
+        ui_blank
+        ui_info "Enter extension names separated by spaces (e.g. mbstring curl xml):"
+        ui_prompt "Extensions:"
+        read -r -a extensions
+    fi
+
+    if [ ${#extensions[@]} -eq 0 ]; then
+        ui_warn "No extensions specified."; return 0
+    fi
+
+    local ok=0 skipped=0
+
+    for ext in "${extensions[@]}"; do
+        local pkg="php${VERSION}-${ext}"
+        _install_or_reinstall_pkg "$pkg" && (( ok++ )) || true || (( skipped++ )) || true
+    done
+
+    ui_blank
+    ui_info "Extensions: ${ok} installed/updated, ${skipped} skipped."
+}
+
+function cmd_ext_remove() {
+    local VERSION="${1:-}"; shift 2>/dev/null || true
+
+    if [ -z "$VERSION" ] || ! is_valid_version "$VERSION"; then
+        ui_error "PHP version required. Usage: $SCRIPT_NAME ext remove <version> <ext...>"
+        exit 1
+    fi
+
+    local extensions=("$@")
+
+    if [ ${#extensions[@]} -eq 0 ]; then
+        ui_prompt "Extensions to remove (space-separated):"
+        read -r -a extensions
+    fi
+
+    if [ ${#extensions[@]} -eq 0 ]; then
+        ui_warn "No extensions specified."; return 0
+    fi
+
+    for ext in "${extensions[@]}"; do
+        local pkg="php${VERSION}-${ext}"
+        if ! cache_dpkg | grep -q "^ii  ${pkg} "; then
+            ui_warn "${pkg} is not installed. Skipping."
+            continue
+        fi
+        if run_apt "Removing ${pkg}..." apt remove -y "$pkg"; then
+            ui_success "Removed ${pkg}"
+        else
+            ui_warn "Failed to remove ${pkg}"
+        fi
+    done
+    ui_blank
+}
+
+function cmd_ext_sync() {
+    local VERSION="${1:-}"
+
+    if [ -z "$VERSION" ] || ! is_valid_version "$VERSION"; then
+        ui_error "PHP version required. Usage: $SCRIPT_NAME ext sync <version>"
+        exit 1
+    fi
+
+    if [ ! -f "$EXT_FILE" ]; then
+        ui_error "Extensions file not found: $EXT_FILE"
+        return 1
+    fi
+
+    local missing=()
+    local installed=0
+    local skipped=0
+    local failed=()
+
+    ui_step "Scanning extensions for PHP ${VERSION}..."
+
+    while read -r ext; do
+        [ -z "$ext" ] && continue
+
+        local pkg="php${VERSION}-${ext}"
+
+        if cache_dpkg | grep -q "^ii  ${pkg} "; then
+            ui_info "${ext} already installed."
+            (( skipped++ )) || true
+        else
+            missing+=( "$ext" )
+        fi
+    done < "$EXT_FILE"
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        ui_success "All extensions from file are already installed."
+        return 0
+    fi
+
+    ui_blank
+    ui_step "Installing missing extensions..."
+
+    for ext in "${missing[@]}"; do
+        local pkg="php${VERSION}-${ext}"
+
+        # Check package exists in apt before attempting install
+        if ! apt-cache show "$pkg" >/dev/null 2>&1; then
+            ui_error "Package not found: ${pkg}"
+            failed+=( "$ext" )
+            continue
+        fi
+
+        ui_info "Installing ${pkg}..."
+
+        if run_apt "Installing ${pkg}..." apt install -y "$pkg"; then
+
+            # Enable extension (safe even if already enabled)
+            phpenmod -v "$VERSION" "$ext" >/dev/null 2>&1
+
+            # Runtime verification (THIS WAS MISSING)
+            if php${VERSION} -m 2>/dev/null | grep -q "^${ext}$"; then
+                ui_success "${ext} installed and active."
+                (( installed++ )) || true
+            else
+                ui_error "${ext} installed but NOT loaded in PHP runtime."
+                failed+=( "$ext" )
+            fi
+
+        else
+            ui_error "Failed to install ${pkg}"
+            failed+=( "$ext" )
+        fi
+    done
+
+    ui_blank
+
+    # Final summary with correct semantics
+    ui_step "Sync Summary"
+    ui_info "Installed: ${installed}"
+    ui_info "Skipped:   ${skipped}"
+
+    if [ ${#failed[@]} -gt 0 ]; then
+        ui_error "Failed extensions: ${failed[*]}"
+        return 1
+    fi
+
+    ui_success "Extension sync completed successfully."
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  SAPI detection helper                                           │
+# │  Returns space-separated list of SAPIs present for a version    │
+# └─────────────────────────────────────────────────────────────────┘
+
+function get_available_sapis() {
+    local VERSION="$1"
+    local sapis=()
+
+    # CLI — always present if PHP is installed
+    [ -d "/etc/php/${VERSION}/cli" ]     && sapis+=("cli")
+
+    # FPM — conf.d directory exists
+    [ -d "/etc/php/${VERSION}/fpm" ]     && sapis+=("fpm")
+
+    # Apache2 mod_php
+    [ -d "/etc/php/${VERSION}/apache2" ] && sapis+=("apache2")
+
+    echo "${sapis[@]}"
+}
+
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  SAPI selection prompt                                           │
+# │  Prints a numbered list and returns chosen SAPIs in             │
+# │  the global _SELECTED_SAPIS array.                              │
+# └─────────────────────────────────────────────────────────────────┘
+
+_SELECTED_SAPIS=()
+
+function prompt_sapi_selection() {
+    local VERSION="$1"
+    local action_label="${2:-enable}"   # "enable" or "disable"
+    _SELECTED_SAPIS=()
+
+    local available_sapis
+    read -r -a available_sapis <<< "$(get_available_sapis "$VERSION")"
+
+    if [ ${#available_sapis[@]} -eq 0 ]; then
+        ui_warn "No PHP ${VERSION} SAPI directories found under /etc/php/${VERSION}/."
+        return 1
+    fi
+
+    if [ "$NONINTERACTIVE" -eq 1 ]; then
+        # --sapi cli,fpm,apache2 answers the prompt; no --sapi means all,
+        # the same default as pressing enter interactively.
+        if [ -z "$SAPI_LIST" ]; then
+            _SELECTED_SAPIS=("${available_sapis[@]}")
+            return 0
+        fi
+        local wanted
+        for wanted in ${SAPI_LIST//,/ }; do
+            if [[ " ${available_sapis[*]} " == *" ${wanted} "* ]]; then
+                _SELECTED_SAPIS+=("$wanted")
+            else
+                ui_warn "SAPI '${wanted}' is not installed for PHP ${VERSION}. Skipping."
+            fi
+        done
+        if [ ${#_SELECTED_SAPIS[@]} -eq 0 ]; then
+            ui_warn "No valid SAPI selected. Aborting."
+            return 1
+        fi
+        return 0
+    fi
+
+    ui_blank
+    printf "  %sSelect SAPIs to %s for PHP %s%s\n" \
+        "$BOLD" "$action_label" "$VERSION" "$RESET"
+    ui_blank
+
+    local i=1
+    for sapi in "${available_sapis[@]}"; do
+        printf "  %s%s%s  %s%s%s\n" "$BOLD$CYAN" "$i" "$RESET" "$WHITE" "$sapi" "$RESET"
+        (( i++ )) || true
+    done
+
+    local all_idx=$(( ${#available_sapis[@]} + 1 ))
+    printf "  %s%s%s  %s%s%s\n" "$BOLD$CYAN" "$all_idx" "$RESET" "$WHITE" "all" "$RESET"
+
+    ui_blank
+    ui_prompt "Choose (e.g. 1, 1 2, or ${all_idx} for all):"
+    read -r -a choices
+    echo ""
+
+    # If user typed nothing, default to all
+    if [ ${#choices[@]} -eq 0 ]; then
+        _SELECTED_SAPIS=("${available_sapis[@]}")
+        ui_info "No selection — defaulting to all SAPIs."
+        return 0
+    fi
+
+    for choice in "${choices[@]}"; do
+        if [ "$choice" = "$all_idx" ]; then
+            _SELECTED_SAPIS=("${available_sapis[@]}")
+            return 0
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && \
+           [ "$choice" -ge 1 ] && \
+           [ "$choice" -le "${#available_sapis[@]}" ]; then
+            _SELECTED_SAPIS+=("${available_sapis[$((choice - 1))]}")
+        else
+            ui_warn "Ignored invalid selection: '${choice}'"
+        fi
+    done
+
+    if [ ${#_SELECTED_SAPIS[@]} -eq 0 ]; then
+        ui_warn "No valid SAPI selected. Aborting."
+        return 1
+    fi
+}
+
+function cmd_ext_enable() {
+    local VERSION="${1:-}"; shift 2>/dev/null || true
+
+    if [ -z "$VERSION" ] || ! is_valid_version "$VERSION"; then
+        ui_error "PHP version required. Usage: $SCRIPT_NAME ext enable <version> <ext...>"
+        exit 1
+    fi
+
+    local extensions=("$@")
+    if [ ${#extensions[@]} -eq 0 ]; then
+        ui_prompt "Extensions to enable (space-separated):"
+        read -r -a extensions
+        echo ""
+    fi
+
+    if [ ${#extensions[@]} -eq 0 ]; then
+        ui_warn "No extensions specified."; return 0
+    fi
+
+    # Prompt for SAPI selection
+    prompt_sapi_selection "$VERSION" "enable" || return 1
+
+    ui_blank
+    ui_info "SAPIs selected: ${_SELECTED_SAPIS[*]}"
+    ui_blank
+
+    for ext in "${extensions[@]}"; do
+        # Verify the extension has a mods-available ini before trying
+        local ini_file="/etc/php/${VERSION}/mods-available/${ext}.ini"
+        if [ ! -f "$ini_file" ]; then
+            ui_warn "${ext}: no ini found at ${ini_file} — may not be installed."
+        fi
+
+        for sapi in "${_SELECTED_SAPIS[@]}"; do
+            ui_step "Enabling ${ext} [${sapi}] for PHP ${VERSION}..."
+            if sudo phpenmod -v "$VERSION" -s "$sapi" "$ext" 2>/dev/null; then
+                ui_success "Enabled ${ext} → ${sapi}"
+            else
+                ui_warn "phpenmod failed for ${ext} [${sapi}] — it may already be enabled or have no ini."
+            fi
+        done
+    done
+
+    # Offer to restart affected services
+    ui_blank
+    _offer_service_restart "$VERSION" "${_SELECTED_SAPIS[@]}"
+    ui_blank
+}
+
+function cmd_ext_disable() {
+    local VERSION="${1:-}"; shift 2>/dev/null || true
+
+    if [ -z "$VERSION" ] || ! is_valid_version "$VERSION"; then
+        ui_error "PHP version required. Usage: $SCRIPT_NAME ext disable <version> <ext...>"
+        exit 1
+    fi
+
+    local extensions=("$@")
+    if [ ${#extensions[@]} -eq 0 ]; then
+        ui_prompt "Extensions to disable (space-separated):"
+        read -r -a extensions
+        echo ""
+    fi
+
+    if [ ${#extensions[@]} -eq 0 ]; then
+        ui_warn "No extensions specified."; return 0
+    fi
+
+    # Prompt for SAPI selection
+    prompt_sapi_selection "$VERSION" "disable" || return 1
+
+    ui_blank
+    ui_info "SAPIs selected: ${_SELECTED_SAPIS[*]}"
+    ui_blank
+
+    for ext in "${extensions[@]}"; do
+        for sapi in "${_SELECTED_SAPIS[@]}"; do
+            ui_step "Disabling ${ext} [${sapi}] for PHP ${VERSION}..."
+            if sudo phpdismod -v "$VERSION" -s "$sapi" "$ext" 2>/dev/null; then
+                ui_success "Disabled ${ext} → ${sapi}"
+            else
+                ui_warn "phpdismod failed for ${ext} [${sapi}] — it may already be disabled."
+            fi
+        done
+    done
+
+    # Offer to restart affected services
+    ui_blank
+    _offer_service_restart "$VERSION" "${_SELECTED_SAPIS[@]}"
+    ui_blank
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Offer service restart after enable/disable                      │
+# └─────────────────────────────────────────────────────────────────┘
+
+function _offer_service_restart() {
+    local VERSION="$1"; shift
+    local sapis=("$@")
+
+    for sapi in "${sapis[@]}"; do
+        case "$sapi" in
+            fpm )
+                if cache_systemctl | grep -q "php${VERSION}-fpm"; then
+                    if ask "Restart php${VERSION}-fpm to apply changes?" restart-fpm; then
+                        ui_step "Restarting php${VERSION}-fpm..."
+                        sudo systemctl restart "php${VERSION}-fpm" \
+                            && ui_success "php${VERSION}-fpm restarted." \
+                            || ui_warn "php${VERSION}-fpm restart failed."
+                    fi
+                fi
+                ;;
+            apache2 )
+                if have_apache; then
+                    if ask "Reload Apache2 to apply changes?" reload-apache; then
+                        ui_step "Reloading Apache2..."
+                        sudo systemctl reload apache2 \
+                            && ui_success "Apache2 reloaded." \
+                            || ui_warn "Apache2 reload failed."
+                    fi
+                fi
+                ;;
+            cli )
+                # No service restart needed for CLI
+                ui_info "CLI changes take effect immediately."
+                ;;
+        esac
+    done
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Interactive menu                                               │
+# └─────────────────────────────────────────────────────────────────┘
+
+function interactive_menu() {
+    local active_cli active_apache apache_label
+
+    ui_header
+
+    active_cli=$(get_cli_php_full_version 2>/dev/null || echo "unknown")
+    active_apache=$(get_apache_php_version)
+    apache_label="${active_apache:-n/a}"
+
+    printf "  %sCLI%s      %s%sPHP %s%s\n" \
+        "$DIM" "$RESET" "$BOLD" "$GREEN" "$active_cli" "$RESET"
+    printf "  %sApache%s   %s%s%s%s\n" \
+        "$DIM" "$RESET" "$BOLD" "$CYAN" \
+        "$( [ -n "$active_apache" ] && echo "PHP ${active_apache}" || echo "n/a" )" \
+        "$RESET"
+
+    local running_fpm
+    running_fpm=$(get_fpm_active_versions | tr '\n' ' ')
+    printf "  %sFPM%s      %s%s%s%s\n" \
+        "$DIM" "$RESET" "$BOLD" "$YELLOW" \
+        "$( [ -n "$running_fpm" ] && echo "PHP ${running_fpm}" || echo "none" )" \
+        "$RESET"
+
+    ui_blank
+    ui_line
+    ui_blank
+
+    printf "  %s%s1%s  %-22s  %s%s\n" "$BOLD" "$CYAN" "$RESET" "Install PHP"         "${DIM}Install a new PHP version${RESET}" ""
+    printf "  %s%s2%s  %-22s  %s%s\n" "$BOLD" "$CYAN" "$RESET" "Remove PHP"          "${DIM}Uninstall a PHP version${RESET}" ""
+    printf "  %s%s3%s  %-22s  %s%s\n" "$BOLD" "$CYAN" "$RESET" "Switch CLI version"  "${DIM}Change active CLI PHP${RESET}" ""
+    printf "  %s%s4%s  %-22s  %s%s\n" "$BOLD" "$CYAN" "$RESET" "Switch Apache SAPI"  "${DIM}Change Apache mod_php${RESET}" ""
+    printf "  %s%s5%s  %-22s  %s%s\n" "$BOLD" "$CYAN" "$RESET" "Manage FPM"          "${DIM}Start/stop/switch FPM${RESET}" ""
+    printf "  %s%s6%s  %-22s  %s%s\n" "$BOLD" "$CYAN" "$RESET" "Extensions"          "${DIM}Install/remove/list extensions${RESET}" ""
+    printf "  %s%s7%s  %-22s  %s%s\n" "$BOLD" "$CYAN" "$RESET" "List local"          "${DIM}All installed PHP versions${RESET}" ""
+    printf "  %s%s8%s  %-22s  %s%s\n" "$BOLD" "$CYAN" "$RESET" "List remote"         "${DIM}Available PHP versions (PPA)${RESET}" ""
+    printf "  %s%s9%s  %-22s  %s%s\n" "$BOLD" "$CYAN" "$RESET" "Version status"      "${DIM}CLI / Apache / FPM versions${RESET}" ""
+    printf "  %s%s0%s  %-22s\n"        "$BOLD" "$RED"  "$RESET" "Exit" ""
+
+    ui_blank
+    ui_line
+    ui_blank
+
+    ui_prompt "Choose [0-9]:"
+    read -r -s -n 1 opt
+    echo ""
+    ui_blank
+
+    case $opt in
+        1) cmd_install ;;
+        2)
+            ui_header; ui_section "Remove PHP"
+            ui_prompt "PHP version to remove:"
+            read -r v; ui_blank
+            cmd_remove "$v"
+            ;;
+        3)
+            ui_header; ui_section "Switch CLI Version"
+            ui_prompt "PHP version:"
+            read -r v; ui_blank
+            [ -n "$v" ] && { _do_switch_cli "$v"; pause; } || ui_warn "Cancelled."
+            ;;
+        4)
+            ui_header; ui_section "Switch Apache SAPI"
+            ui_prompt "PHP version:"
+            read -r v; ui_blank
+            [ -n "$v" ] && { _do_switch_apache "$v"; pause; } || ui_warn "Cancelled."
+            ;;
+        5) _interactive_fpm_menu ;;
+        6) _interactive_ext_menu ;;
+        7) cmd_list; pause ;;
+        8) cmd_list_remote; pause ;;
+        9) cmd_version; pause ;;
+        0)
+            ui_blank
+            printf "  %sGoodbye.%s\n\n" "$DIM" "$RESET"
+            exit 0
+            ;;
+        *)
+            ui_error "Invalid option '${opt}'."
+            sleep 1
+            ;;
+    esac
+}
+
+function _interactive_fpm_menu() {
+    ui_header
+    ui_section "PHP-FPM Management"
+
+    printf "  %s%s1%s  Start FPM for a version\n"   "$BOLD" "$CYAN" "$RESET"
+    printf "  %s%s2%s  Stop FPM for a version\n"    "$BOLD" "$CYAN" "$RESET"
+    printf "  %s%s3%s  Restart FPM for a version\n" "$BOLD" "$CYAN" "$RESET"
+    printf "  %s%s4%s  Reload FPM for a version\n"  "$BOLD" "$CYAN" "$RESET"
+    printf "  %s%s5%s  FPM status (all)\n"           "$BOLD" "$CYAN" "$RESET"
+    printf "  %s%s6%s  Switch active FPM\n"          "$BOLD" "$CYAN" "$RESET"
+    printf "  %s%s0%s  Back\n"                       "$BOLD" "$RED"  "$RESET"
+
+    ui_blank
+    ui_prompt "Choose [0-6]:"
+    read -r -s -n 1 opt
+    echo ""
+    ui_blank
+
+    case $opt in
+        1|2|3|4)
+            local actions=("" "start" "stop" "restart" "reload")
+            ui_prompt "PHP version:"
+            read -r v; ui_blank
+            [ -n "$v" ] && cmd_fpm "${actions[$opt]}" "$v" && pause;
+            _interactive_fpm_menu
+            ;;
+        5) cmd_fpm status; pause; _interactive_fpm_menu ;;
+        6)
+            ui_prompt "Switch FPM to PHP version:"
+            read -r v; ui_blank
+            [ -n "$v" ] && { cmd_fpm use "$v"; pause; _interactive_fpm_menu; }
+            ;;
+        0) return ;;
+        *) ui_warn "Invalid."; sleep 1 ;;
+    esac
+}
+
+function _interactive_ext_menu() {
+    ui_header
+    ui_section "Extension Management"
+
+    printf "  %s%s1%s  List extensions for a version\n"    "$BOLD" "$CYAN" "$RESET"
+    printf "  %s%s2%s  Install extensions\n"                "$BOLD" "$CYAN" "$RESET"
+    printf "  %s%s3%s  Remove extensions\n"                 "$BOLD" "$CYAN" "$RESET"
+    printf "  %s%s4%s  Enable extension (phpenmod)\n"       "$BOLD" "$CYAN" "$RESET"
+    printf "  %s%s5%s  Disable extension (phpdismod)\n"     "$BOLD" "$CYAN" "$RESET"
+    printf "  %s%s6%s  Search available extensions\n"       "$BOLD" "$CYAN" "$RESET"
+    printf "  %s%s7%s  Sync missing extensions from file\n" "$BOLD" "$CYAN" "$RESET"
+    printf "  %s%s0%s  Back\n"                              "$BOLD" "$RED"  "$RESET"
+
+    ui_blank
+    ui_prompt "Choose [0-7]:"
+    read -r -s -n 1 opt
+    echo ""
+
+    local v exts
+
+    case $opt in
+        1)
+            ui_blank; ui_prompt "PHP version:"; read -r v; cmd_ext_list "$v"
+            pause; _interactive_ext_menu;
+            ;;
+        2)
+            ui_blank; ui_prompt "PHP version:"; read -r v
+            ui_blank; ui_info "Enter extension names (space-separated):"
+            ui_prompt "Extensions:"; read -r -a exts
+            cmd_ext_install "$v" "${exts[@]}";
+            pause; _interactive_ext_menu;
+            ;;
+        3)
+            ui_blank; ui_prompt "PHP version:"; read -r v
+            ui_blank; ui_prompt "Extensions to remove:"; read -r -a exts
+            cmd_ext_remove "$v" "${exts[@]}";
+            pause; _interactive_ext_menu;
+            ;;
+        4)
+            ui_blank; ui_prompt "PHP version:"; read -r v
+            ui_blank; ui_prompt "Extensions to enable:"; read -r -a exts
+            cmd_ext_enable "$v" "${exts[@]}";
+            pause; _interactive_ext_menu;
+            ;;
+        5)
+            ui_blank; ui_prompt "PHP version:"; read -r v
+            ui_blank; ui_prompt "Extensions to disable:"; read -r -a exts
+            cmd_ext_disable "$v" "${exts[@]}";
+            pause; _interactive_ext_menu;
+            ;;
+        6)
+            ui_blank; ui_prompt "PHP version:"; read -r v
+            ui_blank; ui_prompt "Search term:"; read -r term
+            cmd_ext_search "$v" "$term";
+            pause; _interactive_ext_menu;
+            ;;
+        7)
+            ui_blank
+            ui_prompt "PHP version:"
+            read -r v
+            cmd_ext_sync "$v"
+            pause
+            _interactive_ext_menu
+            ;;
+        0) return ;;
+        *) ui_warn "Invalid."; pause;  _interactive_ext_menu ;;
+    esac
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Help system                                                     │
+# └─────────────────────────────────────────────────────────────────┘
+
+function show_help() {
+    ui_header
+    ui_section "Usage"
+
+    printf "  %s%s%s %s<command> [args] [flags]%s\n\n" \
+        "$WHITE$BOLD" "$SCRIPT_NAME" "$RESET" "$DIM" "$RESET"
+
+    ui_subsection "Version commands"
+    ui_tag "version"      "Show CLI / Apache / FPM versions"
+    ui_tag "version cli"  "Print only CLI version (scriptable)"
+    ui_tag "version apache" "Print only Apache SAPI version"
+    ui_tag "version fpm"  "Print running FPM versions"
+    ui_tag "latest"       "Show the latest available PHP version"
+
+    ui_subsection "Installation"
+    ui_tag "install [ver]"  "Install a PHP version interactively"
+    ui_tag "remove <ver>"   "Uninstall a PHP version"
+
+    ui_subsection "Switching"
+    ui_tag "use <ver> [--cli] [--apache] [--fpm] [--all]" \
+           "Switch active PHP version"
+    ui_tag "apache use <ver>"  "Switch Apache SAPI only"
+    ui_tag "fpm use <ver>"     "Switch active FPM version"
+
+    ui_subsection "Listing"
+    ui_tag "list"        "List locally installed PHP versions"
+    ui_tag "list-remote" "List PHP versions available from PPA"
+
+    ui_subsection "FPM service control"
+    ui_tag "fpm start|stop|restart|reload [ver]" "Control FPM service(s)"
+    ui_tag "fpm status [ver]"                     "Show FPM service status"
+
+    ui_subsection "Extension management"
+    ui_tag "ext list <ver>"              "List installed extensions"
+    ui_tag "ext search <ver> <term>"     "Search available extensions"
+    ui_tag "ext install <ver> <ext...>"  "Install one or more extensions"
+    ui_tag "ext remove <ver> <ext...>"   "Remove one or more extensions"
+    ui_tag "ext enable <ver> <ext...>"   "Enable via phpenmod (prompts for SAPI)"
+    ui_tag "ext disable <ver> <ext...>"  "Disable via phpdismod (prompts for SAPI)"
+    ui_tag "ext sync <ver>" "Install only missing extensions from extensions file"
+
+    ui_subsection "Interactive mode"
+    ui_tag "interactive"  "Launch the full interactive menu (default when no args)"
+    
+
+    ui_subsection "Flags"
+    printf "  %s%-30s%s %s\n" "$CYAN" "--help, -h [topic]" "$RESET" "Show help"
+    printf "  %s%-30s%s %s\n" "$CYAN" "--version, -V"       "$RESET" "Show phpmgr version"
+    printf "  %s%-30s%s %s\n" "$CYAN" "--no-prompt"         "$RESET" "Answer all prompts 'no', never pause (put before command)"
+    printf "  %s%-30s%s %s\n" "$CYAN" "--yes <key>"         "$RESET" "Answer one prompt 'yes' (repeatable; implies --no-prompt)"
+    printf "  %s%-30s%s %s\n" "$CYAN" "--sapi <list>"       "$RESET" "SAPIs for ext enable/disable, e.g. cli,fpm,apache2"
+    printf "  %s%-30s%s %s\n" "$CYAN" "list --porcelain"    "$RESET" "Tab-separated version list for scripts"
+    printf "  %s%-30s%s %s\n" "$CYAN" "ext list <ver> --porcelain" "$RESET" "Tab-separated module/SAPI state"
+    ui_blank
+    ui_info "Prompt keys: reinstall, mod-php, ext-file, use-cli, use-apache, remove,"
+    ui_info "install-mod-php, fpm-start-anyway, also-apache, restart-fpm, reload-apache"
+    ui_info "Example: $SCRIPT_NAME --yes mod-php --yes use-cli install 8.4"
+
+    ui_blank
+    ui_section "Examples"
+    ui_info "$SCRIPT_NAME version"
+    ui_info "$SCRIPT_NAME use 8.3"
+    ui_info "$SCRIPT_NAME use 8.3 --all"
+    ui_info "$SCRIPT_NAME install 8.4"
+    ui_info "$SCRIPT_NAME ext install 8.3 mbstring curl xml gd"
+    ui_info "$SCRIPT_NAME ext disable 8.3 xdebug"
+    ui_info "$SCRIPT_NAME fpm restart 8.3"
+    ui_info "$SCRIPT_NAME list-remote"
+    ui_info "$SCRIPT_NAME latest"
+
+    ui_footer
+}
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  Entry point                                                     │
+# └─────────────────────────────────────────────────────────────────┘
+
+# Global options (must come before the command):
+#   --no-prompt         answer every yes/no prompt with "no", never pause
+#   --yes <key>         answer the prompt with this key "yes" (implies --no-prompt)
+#   --sapi <list>       comma list for ext enable/disable (cli,fpm,apache2)
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-prompt )
+            NONINTERACTIVE=1
+            shift
+            ;;
+        --yes )
+            if [ -z "${2:-}" ]; then
+                ui_error "--yes requires a prompt key (e.g. --yes use-cli)"
+                exit 1
+            fi
+            NONINTERACTIVE=1
+            ASSUME_YES["$2"]=1
+            shift 2
+            ;;
+        --sapi )
+            if [ -z "${2:-}" ]; then
+                ui_error "--sapi requires a value (e.g. --sapi cli,fpm)"
+                exit 1
+            fi
+            SAPI_LIST="$2"
+            shift 2
+            ;;
+        * )
+            break
+            ;;
+    esac
+done
+
+# No arguments → interactive mode
+if [ $# -eq 0 ]; then
+    if [ "$NONINTERACTIVE" -eq 1 ]; then
+        ui_error "A command is required with --no-prompt / --yes."
+        exit 1
+    fi
+    while true; do
+        interactive_menu
+    done
+fi
+
+CMD="${1}"; shift
+
+case "$CMD" in
+    # ── Version information ───────────────────────────────────────
+    version )
+        cmd_version "${1:-all}"
+        ;;
+
+    # ── Latest ───────────────────────────────────────────────────
+    latest )
+        cmd_latest
+        ;;
+
+    # ── Installation ─────────────────────────────────────────────
+    install )
+        cmd_install "${1:-}"
+        ;;
+
+    remove|uninstall )
+        cmd_remove "${1:-}"
+        ;;
+
+    # ── Switching ────────────────────────────────────────────────
+    use )
+        cmd_use "${1:-}" "${@:2}"
+        ;;
+
+    apache )
+        local_sub="${1:-}"; shift 2>/dev/null || true
+        case "$local_sub" in
+            use ) cmd_apache_use "${1:-}" ;;
+            * )
+                ui_error "Unknown apache subcommand: '${local_sub}'"
+                ui_info "Usage: $SCRIPT_NAME apache use <version>"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    # ── FPM ──────────────────────────────────────────────────────
+    fpm )
+        cmd_fpm "${1:-status}" "${2:-}"
+        ;;
+
+    # ── Listing ──────────────────────────────────────────────────
+    list|ls )
+        cmd_list "$@"
+        ;;
+
+    list-remote|remote|ls-remote )
+        cmd_list_remote
+        ;;
+
+    # ── Extensions ───────────────────────────────────────────────
+    ext|extension|extensions )
+        cmd_ext "$@"
+        ;;
+
+    # ── Interactive ──────────────────────────────────────────────
+    interactive|menu|i )
+        while true; do
+            interactive_menu
+        done
+        ;;
+
+    # ── Meta ─────────────────────────────────────────────────────
+    --help|-h|help )
+        show_help
+        exit 0
+        ;;
+
+    --version|-V )
+        printf "%s%s%s version %s%s%s\n" \
+            "$BOLD" "$SCRIPT_NAME" "$RESET" \
+            "$GREEN" "$SCRIPT_VERSION" "$RESET"
+        exit 0
+        ;;
+
+    * )
+        ui_error "Unknown command: '${CMD}'"
+        ui_info  "Run '$SCRIPT_NAME --help' for usage."
+        exit 1
+        ;;
+esac

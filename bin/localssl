@@ -1,0 +1,467 @@
+#!/bin/bash
+# callismart-ssl.sh
+# Manage local-dev SSL certificates (mkcert + Apache) for a given domain.
+#
+# Usage:
+#   sudo callismart-ssl <command> --domain <domain.tld> [options]
+#
+# Author: Callistus Nwachukwu
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+MARKER="# Callismart Magic"
+
+COMMAND=""
+CERT_ACTION=""
+DOMAIN=""
+DOCROOT=""
+FORCE=0
+BASE_WWW="/var/www"
+
+usage() {
+    cat <<EOF
+${SCRIPT_NAME} - manage local SSL certificates for development domains
+
+Usage:
+  sudo ${SCRIPT_NAME} <command> --domain <domain.tld> [options]
+
+Commands:
+  install      Generate certificate + Apache vhost SSL block for a domain
+  uninstall    Remove certificate, SSL vhost block, and hosts entry for a domain
+  reinstall    Uninstall then install (regenerate everything)
+  status       Show certificate / vhost / hosts state for a domain
+  list         List domains currently managed by this tool
+  cert issue   Generate (or keep) only the certificate for a domain
+  cert remove  Delete only the certificate for a domain
+  help         Show this help message
+
+Options:
+  --domain <domain.tld>   Domain to operate on
+                           (required for every command except list and help)
+  --docroot <path>        Custom document root (install/reinstall only).
+                           Must resolve inside ${BASE_WWW}/ — anything outside
+                           it is rejected. Defaults to ${BASE_WWW}/html/<domain>.
+  -f, --force             Overwrite an existing certificate on install;
+                           skip confirmation prompts on uninstall/reinstall;
+                           create --docroot if it doesn't exist yet.
+  -h, --help              Show this help message
+
+Examples:
+  sudo ${SCRIPT_NAME} install --domain smartwoo.local
+  sudo ${SCRIPT_NAME} install --domain smartwoo.local --docroot /var/www/smartwoo/public -f
+  sudo ${SCRIPT_NAME} uninstall --domain smartwoo.local --force
+  sudo ${SCRIPT_NAME} reinstall --domain smartwoo.local
+  sudo ${SCRIPT_NAME} status --domain smartwoo.local
+  sudo ${SCRIPT_NAME} list
+  sudo ${SCRIPT_NAME} cert issue --domain smartwoo.local
+
+  'cert' touches only /etc/ssl/<domain>/ — no vhost or /etc/hosts changes.
+  It is what sitemgr uses for HTTPS sites.
+EOF
+}
+
+# ---------- argument parsing ----------
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 1
+fi
+
+case "$1" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    install|uninstall|reinstall|status|list|help)
+        COMMAND="$1"
+        shift
+        ;;
+    cert)
+        COMMAND="cert"
+        CERT_ACTION="${2:-}"
+        case "$CERT_ACTION" in
+            issue|remove) shift 2 ;;
+            *)
+                echo "❌ Usage: ${SCRIPT_NAME} cert <issue|remove> --domain <domain.tld>"
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        echo "❌ Unknown command: $1"
+        usage
+        exit 1
+        ;;
+esac
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --domain)
+            DOMAIN="${2:-}"
+            if [ -z "$DOMAIN" ]; then
+                echo "❌ --domain requires a value."
+                exit 1
+            fi
+            shift 2
+            ;;
+        --domain=*)
+            DOMAIN="${1#*=}"
+            shift
+            ;;
+        --docroot)
+            DOCROOT="${2:-}"
+            if [ -z "$DOCROOT" ]; then
+                echo "❌ --docroot requires a value."
+                exit 1
+            fi
+            shift 2
+            ;;
+        --docroot=*)
+            DOCROOT="${1#*=}"
+            shift
+            ;;
+        -f|--force)
+            FORCE=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "❌ Unknown option: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+if [ "$COMMAND" = "help" ]; then
+    usage
+    exit 0
+fi
+
+if [ "$COMMAND" != "list" ] && [ -z "$DOMAIN" ]; then
+    echo "❌ --domain is required for '${COMMAND}'."
+    usage
+    exit 1
+fi
+
+# --- Validate the domain ---
+# DOMAIN ends up in file paths, sed patterns and an `rm -rf` target
+# (/etc/ssl/${DOMAIN}), so only plain hostnames are accepted. Without this,
+# --domain .. would make uninstall delete /etc.
+DOMAIN_RE='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+if [ -n "$DOMAIN" ] && ! [[ "$DOMAIN" =~ $DOMAIN_RE ]]; then
+    echo "❌ Invalid domain: ${DOMAIN} (expected something like smartwoo.local)"
+    exit 1
+fi
+
+# --- Resolve and guard the document root ---
+# --docroot must resolve (after collapsing any ../ segments) to a path
+# inside $BASE_WWW. This blocks tricks like --docroot /var/www/../etc
+# from pointing Apache's DocumentRoot somewhere outside /var/www.
+if [ -n "$DOCROOT" ]; then
+    RESOLVED_DOCROOT=$(realpath -m -- "$DOCROOT")
+    case "$RESOLVED_DOCROOT" in
+        "$BASE_WWW"|"$BASE_WWW"/*)
+            DOC_ROOT="$RESOLVED_DOCROOT"
+            ;;
+        *)
+            echo "❌ --docroot must resolve inside ${BASE_WWW}/ (got: ${RESOLVED_DOCROOT})"
+            exit 1
+            ;;
+    esac
+else
+    DOC_ROOT="${BASE_WWW}/html/${DOMAIN}"
+fi
+
+SSL_DIR="/etc/ssl/${DOMAIN}"
+VHOST_CONF="/etc/apache2/sites-available/${DOMAIN}.conf"
+
+# The invoking (non-root) user owns the mkcert CA. sudo sets SUDO_USER;
+# pkexec (used by the desktop GUI) sets PKEXEC_UID instead.
+if [ -n "${SUDO_USER:-}" ]; then
+    REAL_USER="$SUDO_USER"
+elif [ -n "${PKEXEC_UID:-}" ]; then
+    REAL_USER=$(id -un "$PKEXEC_UID")
+else
+    REAL_USER=$(id -un)
+fi
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+
+run_as_user() {
+    sudo -u "$REAL_USER" HOME="$REAL_HOME" "$@"
+}
+
+confirm() {
+    if [ "$FORCE" -eq 1 ]; then
+        return 0
+    fi
+    read -r -p "$1 [y/N] " reply
+    case "$reply" in
+        [yY][eE][sS]|[yY]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------- certificate helpers ----------
+
+# Create /etc/ssl/<domain>/<domain>.{crt,key} with mkcert, as the invoking
+# user so the certificate is signed by *their* local CA. Keeps an existing
+# certificate unless --force is given.
+issue_cert() {
+    if ! command -v mkcert >/dev/null 2>&1; then
+        echo "❌ mkcert not found. Install it first:"
+        echo "    https://github.com/FiloSottile/mkcert"
+        exit 1
+    fi
+
+    local caroot
+    caroot=$(run_as_user mkcert -CAROOT)
+    if [ ! -f "${caroot}/rootCA.pem" ]; then
+        echo "🔧 Installing local mkcert CA..."
+        run_as_user mkcert -install
+    fi
+
+    sudo mkdir -p "$SSL_DIR"
+
+    if [ -f "${SSL_DIR}/${DOMAIN}.crt" ] && [ -f "${SSL_DIR}/${DOMAIN}.key" ] && [ "$FORCE" -ne 1 ]; then
+        echo "✅ SSL certificate already exists for ${DOMAIN} (use --force to regenerate)"
+    else
+        echo "🔧 Generating SSL certificate for ${DOMAIN}..."
+        # The temp dir must belong to the invoking user: mkcert runs as them
+        # and cannot write into a root-owned 0700 directory (the case when
+        # this script itself runs as root via sudo or pkexec).
+        local tmp_dir
+        tmp_dir=$(run_as_user mktemp -d)
+        run_as_user mkcert -key-file "${tmp_dir}/${DOMAIN}.key" -cert-file "${tmp_dir}/${DOMAIN}.crt" "${DOMAIN}" "www.${DOMAIN}"
+        sudo mv -f "${tmp_dir}/${DOMAIN}.key" "${tmp_dir}/${DOMAIN}.crt" "$SSL_DIR"/
+        rmdir "$tmp_dir"
+    fi
+
+    sudo chown -R www-data:www-data "$SSL_DIR"
+    sudo find "$SSL_DIR" -type d -exec chmod 775 {} \;
+    sudo find "$SSL_DIR" -type f -exec chmod 664 {} \;
+    sudo chmod -R g+s "$SSL_DIR"
+}
+
+remove_cert() {
+    if [ -d "$SSL_DIR" ]; then
+        echo "🗑  Removing certificate directory: ${SSL_DIR}"
+        sudo rm -rf "$SSL_DIR"
+    else
+        echo "ℹ️  No certificate directory found for ${DOMAIN}"
+    fi
+}
+
+# ---------- command implementations ----------
+
+cmd_install() {
+    if [ ! -d "$DOC_ROOT" ]; then
+        if [ "$FORCE" -eq 1 ]; then
+            echo "📁 Document root does not exist, creating (forced): $DOC_ROOT"
+            sudo mkdir -p "$DOC_ROOT"
+        else
+            echo "❌ Document root does not exist: $DOC_ROOT"
+            echo "   Use -f/--force to create it automatically."
+            exit 1
+        fi
+    fi
+
+    issue_cert
+
+    if [ ! -f "$VHOST_CONF" ]; then
+        echo "📄 Creating new Apache virtual host file: ${VHOST_CONF}"
+        sudo tee "$VHOST_CONF" > /dev/null <<EOF
+<VirtualHost *:80>
+    ServerName ${DOMAIN}
+    ServerAlias www.${DOMAIN}
+    DocumentRoot ${DOC_ROOT}
+
+    <Directory ${DOC_ROOT}>
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName ${DOMAIN}
+    ServerAlias www.${DOMAIN}
+    DocumentRoot ${DOC_ROOT}
+
+    SSLEngine on
+    SSLCertificateFile ${SSL_DIR}/${DOMAIN}.crt
+    SSLCertificateKeyFile ${SSL_DIR}/${DOMAIN}.key
+
+    <Directory ${DOC_ROOT}>
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>
+EOF
+    else
+        echo "🔍 Updating existing vhost file for ${DOMAIN}..."
+        if grep -q "SSLCertificateFile" "$VHOST_CONF"; then
+            sudo sed -i "s|SSLCertificateFile .*|SSLCertificateFile ${SSL_DIR}/${DOMAIN}.crt|g" "$VHOST_CONF"
+            sudo sed -i "s|SSLCertificateKeyFile .*|SSLCertificateKeyFile ${SSL_DIR}/${DOMAIN}.key|g" "$VHOST_CONF"
+            echo "✅ Updated certificate paths in vhost file."
+        else
+            echo "➕ Adding SSL configuration block..."
+            sudo tee -a "$VHOST_CONF" > /dev/null <<EOF
+
+<VirtualHost *:443>
+    ServerName ${DOMAIN}
+    ServerAlias www.${DOMAIN}
+    DocumentRoot ${DOC_ROOT}
+
+    SSLEngine on
+    SSLCertificateFile ${SSL_DIR}/${DOMAIN}.crt
+    SSLCertificateKeyFile ${SSL_DIR}/${DOMAIN}.key
+
+    <Directory ${DOC_ROOT}>
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+</VirtualHost>
+EOF
+        fi
+    fi
+
+    sudo a2ensite "${DOMAIN}.conf" >/dev/null 2>&1
+    sudo a2enmod ssl >/dev/null 2>&1
+
+    echo "🔁 Reloading Apache..."
+    sudo systemctl reload apache2
+
+    sudo sed -i "/${DOMAIN}.*${MARKER}/d" /etc/hosts
+    echo "127.0.0.1 ${DOMAIN} www.${DOMAIN} ${MARKER}" \
+        | sudo tee -a /etc/hosts >/dev/null
+
+    echo "✅ SSL active for: https://${DOMAIN}"
+}
+
+cmd_uninstall() {
+    echo "This will remove the SSL certificate, SSL vhost block, and hosts entry for: ${DOMAIN}"
+    if ! confirm "Continue?"; then
+        echo "Aborted."
+        exit 0
+    fi
+
+    remove_cert
+
+    if [ -f "$VHOST_CONF" ]; then
+        if grep -q '<VirtualHost \*:443>' "$VHOST_CONF"; then
+            echo "✂️  Removing SSL (:443) block from ${VHOST_CONF}"
+            sudo sed -i '/<VirtualHost \*:443>/,/<\/VirtualHost>/d' "$VHOST_CONF"
+        fi
+
+        if ! grep -q '<VirtualHost' "$VHOST_CONF"; then
+            echo "🗑  Vhost file has no vhosts left, removing: ${VHOST_CONF}"
+            sudo a2dissite "${DOMAIN}.conf" >/dev/null 2>&1 || true
+            sudo rm -f "$VHOST_CONF"
+        fi
+    else
+        echo "ℹ️  No vhost file found for ${DOMAIN}"
+    fi
+
+    echo "🔁 Reloading Apache..."
+    sudo systemctl reload apache2 || true
+
+    if [ -f /etc/hosts ]; then
+        sudo sed -i "/${DOMAIN}.*${MARKER}/d" /etc/hosts
+    fi
+
+    echo "✅ SSL removed for: ${DOMAIN}"
+}
+
+cmd_cert() {
+    case "$CERT_ACTION" in
+        issue)
+            issue_cert
+            echo "✅ Certificate ready: ${SSL_DIR}/${DOMAIN}.crt"
+            ;;
+        remove)
+            remove_cert
+            ;;
+    esac
+}
+
+cmd_reinstall() {
+    local force_orig="$FORCE"
+    FORCE=1
+    cmd_uninstall
+    FORCE="$force_orig"
+    cmd_install
+}
+
+cmd_status() {
+    echo "Status for ${DOMAIN}:"
+    echo
+
+    if [ -f "${SSL_DIR}/${DOMAIN}.crt" ]; then
+        echo "🔐 Certificate: ${SSL_DIR}/${DOMAIN}.crt"
+        local end_date
+        end_date=$(openssl x509 -enddate -noout -in "${SSL_DIR}/${DOMAIN}.crt" 2>/dev/null | cut -d= -f2)
+        echo "   Expires: ${end_date:-unknown}"
+    else
+        echo "🔐 Certificate: not found"
+    fi
+
+    if [ -f "$VHOST_CONF" ]; then
+        echo "📄 Vhost file: ${VHOST_CONF}"
+        if grep -q '<VirtualHost \*:443>' "$VHOST_CONF"; then
+            echo "   SSL block: present"
+        else
+            echo "   SSL block: missing"
+        fi
+        if [ -L "/etc/apache2/sites-enabled/${DOMAIN}.conf" ]; then
+            echo "   Site enabled: yes"
+        else
+            echo "   Site enabled: no"
+        fi
+    else
+        echo "📄 Vhost file: not found"
+    fi
+
+    if grep -q "${DOMAIN}.*${MARKER}" /etc/hosts 2>/dev/null; then
+        echo "🌐 /etc/hosts entry: present"
+    else
+        echo "🌐 /etc/hosts entry: missing"
+    fi
+}
+
+cmd_list() {
+    echo "Domains managed by ${SCRIPT_NAME}:"
+    echo
+
+    # Only count /etc/ssl/<domain>/<domain>.crt — the layout install creates.
+    # A plain /etc/ssl/*/*.crt glob also matches system files such as
+    # /etc/ssl/certs/ca-certificates.crt and reports "certs" as a domain.
+    local found=0 dir d crt end_date
+    for dir in /etc/ssl/*/; do
+        d=$(basename "$dir")
+        crt="${dir}${d}.crt"
+        [ -f "$crt" ] || continue
+        found=1
+        end_date=$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | cut -d= -f2)
+        printf "  %-30s expires: %s\n" "$d" "${end_date:-unknown}"
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo "  (none found)"
+    fi
+}
+
+# ---------- dispatch ----------
+
+case "$COMMAND" in
+    install)   cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    reinstall) cmd_reinstall ;;
+    status)    cmd_status ;;
+    list)      cmd_list ;;
+    cert)      cmd_cert ;;
+esac

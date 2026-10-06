@@ -1,0 +1,706 @@
+#!/bin/bash
+# sitemgr — manage Apache development sites: vhost, document root,
+# per-site PHP handler (global mod_php or a chosen PHP-FPM version),
+# HTTPS (certificates via localssl) and the /etc/hosts entry.
+#
+# Usage:
+#   sudo sitemgr <command> [--domain <domain.tld>] [options]
+#
+# Author: Callistus Nwachukwu
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+HOSTS_MARKER="# Callismart Magic"      # same marker localssl uses
+MANAGED_MARKER="# Managed by sitemgr"
+BASE_WWW="/var/www"
+SITES_AVAILABLE="/etc/apache2/sites-available"
+SITES_ENABLED="/etc/apache2/sites-enabled"
+BACKUP_DIR="/var/backups/sitemgr"
+LOG_DIR="/var/log/apache2"
+
+DOMAIN_RE='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+PHP_RE='^(mod_php|fpm:[0-9]+\.[0-9]+)$'
+
+COMMAND=""
+DOMAIN=""
+DOCROOT=""
+PHP_MODE=""
+SSL=""
+CREATE_DOCROOT=0
+KEEP_CERT=0
+YES=0
+PORCELAIN=0
+LOG_KIND="error"
+LOG_LINES=200
+
+usage() {
+    cat <<EOF
+${SCRIPT_NAME} - manage Apache development sites
+
+Usage:
+  sudo ${SCRIPT_NAME} <command> --domain <domain.tld> [options]
+
+Commands:
+  create     Create a site: vhost, hosts entry, optional HTTPS
+  edit       Change a managed site's document root, PHP handler or HTTPS
+  delete     Remove a site's vhost, hosts entry and certificate
+             (the document root and logs are kept)
+  enable     Enable a site (a2ensite)
+  disable    Disable a site (a2dissite)
+  adopt      Take over an existing vhost not created by ${SCRIPT_NAME}
+             (rewrites it from ${SCRIPT_NAME}'s template; original is backed up)
+  status     Show a site's configuration and state
+  list       List every vhost in ${SITES_AVAILABLE}
+  logs       Print the end of a site's Apache log
+  help       Show this help message
+
+Options:
+  --domain <domain.tld>   Site to operate on (all commands except list/help)
+  --docroot <path>        Document root; must resolve inside ${BASE_WWW}/.
+                           Default for create: ${BASE_WWW}/html/<domain>
+  --php <handler>         mod_php      use Apache's global mod_php version
+                          fpm:<ver>    use php<ver>-fpm, e.g. fpm:8.3
+                           Default for create: mod_php
+  --ssl | --no-ssl        Serve HTTPS (default for create: --ssl)
+  --create-docroot        Create the document root if it does not exist
+  --keep-cert             delete: keep the certificate in /etc/ssl/<domain>
+  -y, --yes               delete/adopt: skip the confirmation prompt
+  --porcelain             list: tab-separated output for scripts
+  --error | --access      logs: which log (default: --error)
+  --lines <n>             logs: how many lines (default: ${LOG_LINES})
+  -h, --help              Show this help message
+
+Examples:
+  sudo ${SCRIPT_NAME} create --domain shop.local --docroot /var/www/shop/public --php fpm:8.3 --create-docroot
+  sudo ${SCRIPT_NAME} edit --domain shop.local --php fpm:8.4
+  sudo ${SCRIPT_NAME} edit --domain shop.local --no-ssl
+  sudo ${SCRIPT_NAME} adopt --domain smartwoo.local
+  ${SCRIPT_NAME} list
+  ${SCRIPT_NAME} logs --domain shop.local --access --lines 50
+EOF
+}
+
+die() {
+    echo "❌ $*"
+    exit 1
+}
+
+# ---------- argument parsing ----------
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 1
+fi
+
+case "$1" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    create|edit|delete|enable|disable|adopt|status|list|logs)
+        COMMAND="$1"
+        shift
+        ;;
+    *)
+        echo "❌ Unknown command: $1"
+        usage
+        exit 1
+        ;;
+esac
+
+need_value() {
+    if [ -z "${2:-}" ]; then
+        die "$1 requires a value."
+    fi
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --domain)         need_value "$1" "${2:-}"; DOMAIN="$2"; shift 2 ;;
+        --domain=*)       DOMAIN="${1#*=}"; shift ;;
+        --docroot)        need_value "$1" "${2:-}"; DOCROOT="$2"; shift 2 ;;
+        --docroot=*)      DOCROOT="${1#*=}"; shift ;;
+        --php)            need_value "$1" "${2:-}"; PHP_MODE="$2"; shift 2 ;;
+        --php=*)          PHP_MODE="${1#*=}"; shift ;;
+        --ssl)            SSL="on"; shift ;;
+        --no-ssl)         SSL="off"; shift ;;
+        --create-docroot) CREATE_DOCROOT=1; shift ;;
+        --keep-cert)      KEEP_CERT=1; shift ;;
+        -y|--yes)         YES=1; shift ;;
+        --porcelain)      PORCELAIN=1; shift ;;
+        --error)          LOG_KIND="error"; shift ;;
+        --access)         LOG_KIND="access"; shift ;;
+        --lines)          need_value "$1" "${2:-}"; LOG_LINES="$2"; shift 2 ;;
+        -h|--help)        usage; exit 0 ;;
+        *)
+            echo "❌ Unknown option: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+if [ "$COMMAND" != "list" ]; then
+    [ -n "$DOMAIN" ] || die "--domain is required for '${COMMAND}'."
+    # DOMAIN goes into file paths, sed patterns and Apache config.
+    [[ "$DOMAIN" =~ $DOMAIN_RE ]] || die "Invalid domain: ${DOMAIN} (expected something like shop.local)"
+fi
+
+if [ -n "$PHP_MODE" ] && ! [[ "$PHP_MODE" =~ $PHP_RE ]]; then
+    die "Invalid --php value: ${PHP_MODE} (use mod_php or fpm:<version>, e.g. fpm:8.3)"
+fi
+
+[[ "$LOG_LINES" =~ ^[0-9]+$ ]] || die "--lines must be a number."
+
+case "$COMMAND" in
+    create|edit|delete|enable|disable|adopt)
+        [ "$(id -u)" -eq 0 ] || die "'${COMMAND}' changes system files. Run: sudo ${SCRIPT_NAME} ${COMMAND} ..."
+        ;;
+esac
+
+VHOST_CONF="${SITES_AVAILABLE}/${DOMAIN}.conf"
+
+# The person behind sudo / pkexec, for docroot ownership.
+if [ -n "${SUDO_USER:-}" ]; then
+    REAL_USER="$SUDO_USER"
+elif [ -n "${PKEXEC_UID:-}" ]; then
+    REAL_USER=$(id -un "$PKEXEC_UID")
+else
+    REAL_USER=$(id -un)
+fi
+
+# ---------- helpers ----------
+
+confirm() {
+    if [ "$YES" -eq 1 ]; then
+        return 0
+    fi
+    read -r -p "$1 [y/N] " reply || true
+    case "$reply" in
+        [yY][eE][sS]|[yY]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+find_localssl() {
+    local candidate
+    for candidate in "${LOCALSSL_BIN:-}" \
+        "$(command -v localssl 2>/dev/null || true)" \
+        "$(command -v callismart-ssl 2>/dev/null || true)" \
+        /usr/local/bin/localssl; do
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+is_managed() {
+    [ -f "$1" ] && grep -q "^${MANAGED_MARKER}" "$1"
+}
+
+is_enabled() {
+    [ -e "${SITES_ENABLED}/$1.conf" ]
+}
+
+# meta_get <file> <key> — value of a "# sitemgr:<key>=<value>" line
+meta_get() {
+    sed -n "s/^# sitemgr:$2=//p" "$1" | head -n 1
+}
+
+# Best-effort detection for vhosts sitemgr did not write.
+detect_docroot() {
+    grep -m 1 -iE '^[[:space:]]*DocumentRoot[[:space:]]' "$1" 2>/dev/null \
+        | awk '{print $2}' | tr -d '"' || true
+}
+
+detect_php() {
+    local ver
+    ver=$(grep -oE 'php[0-9]+\.[0-9]+-fpm\.sock' "$1" 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+' || true)
+    if [ -n "$ver" ]; then
+        echo "fpm:${ver}"
+    else
+        echo "mod_php"
+    fi
+}
+
+detect_ssl() {
+    if grep -qE '<VirtualHost[^>]*:443>' "$1" 2>/dev/null; then
+        echo "on"
+    else
+        echo "off"
+    fi
+}
+
+# resolve_docroot <path> — sets RESOLVED_DOCROOT or exits
+resolve_docroot() {
+    RESOLVED_DOCROOT=$(realpath -m -- "$1")
+    case "$RESOLVED_DOCROOT" in
+        "$BASE_WWW"|"$BASE_WWW"/*) ;;
+        *) die "Document root must resolve inside ${BASE_WWW}/ (got: ${RESOLVED_DOCROOT})" ;;
+    esac
+}
+
+ensure_docroot() {
+    local root="$1"
+    if [ -d "$root" ]; then
+        return 0
+    fi
+    if [ "$CREATE_DOCROOT" -ne 1 ]; then
+        die "Document root does not exist: ${root} (pass --create-docroot to create it)"
+    fi
+    echo "📁 Creating document root: ${root}"
+    mkdir -p "$root"
+    # Owned by you, group www-data, so you can edit files and Apache can read them.
+    chown "${REAL_USER}:www-data" "$root"
+    chmod 2775 "$root"
+}
+
+# Make sure the chosen PHP handler can actually serve requests.
+prepare_php() {
+    case "$1" in
+        mod_php)
+            if ! compgen -G "/etc/apache2/mods-enabled/php*.load" > /dev/null; then
+                echo "⚠️  No mod_php module is enabled — PHP files will not run on this site"
+                echo "   until you enable one (e.g. phpmgr apache use 8.3) or switch it to FPM."
+            fi
+            ;;
+        fpm:*)
+            local ver="${1#fpm:}"
+            [ -x "/usr/sbin/php-fpm${ver}" ] || die "PHP ${ver} FPM is not installed (phpmgr install ${ver})"
+            a2enmod -q proxy_fcgi setenvif > /dev/null
+            if ! systemctl enable --now "php${ver}-fpm" > /dev/null 2>&1; then
+                die "Could not start php${ver}-fpm (see: systemctl status php${ver}-fpm)"
+            fi
+            echo "🐘 php${ver}-fpm is enabled and running"
+            ;;
+    esac
+}
+
+ensure_cert() {
+    local localssl
+    localssl=$(find_localssl) || die "localssl not found — it is needed for HTTPS (or use --no-ssl)."
+    "$localssl" cert issue --domain "$DOMAIN"
+    a2enmod -q ssl > /dev/null
+}
+
+remove_cert() {
+    local localssl
+    if ! localssl=$(find_localssl); then
+        echo "⚠️  localssl not found — certificate in /etc/ssl/${DOMAIN} left in place."
+        return 0
+    fi
+    "$localssl" cert remove --domain "$DOMAIN"
+}
+
+hosts_remove() {
+    local re="${DOMAIN//./\\.}"
+    sed -i "/[[:space:]]${re}[[:space:]].*${HOSTS_MARKER}\$/d" /etc/hosts
+}
+
+hosts_add() {
+    hosts_remove
+    echo "127.0.0.1 ${DOMAIN} www.${DOMAIN} ${HOSTS_MARKER}" >> /etc/hosts
+}
+
+hosts_present() {
+    local re="${DOMAIN//./\\.}"
+    grep -qE "[[:space:]]${re}[[:space:]].*${HOSTS_MARKER}\$" /etc/hosts 2>/dev/null
+}
+
+# ---------- vhost template ----------
+
+php_block() {
+    case "$1" in
+        mod_php)
+            echo "    # PHP: Apache's global mod_php (switch it with: phpmgr apache use <version>)"
+            ;;
+        fpm:*)
+            local ver="${1#fpm:}"
+            # A distinct fcgi:// name per version keeps Apache from sharing
+            # one connection pool between different FPM sockets.
+            cat <<EOF
+    # PHP: php${ver}-fpm
+    <FilesMatch "\\.ph(ar|p|tml)\$">
+        SetHandler "proxy:unix:/run/php/php${ver}-fpm.sock|fcgi://php${ver//./}-fpm"
+    </FilesMatch>
+EOF
+            ;;
+    esac
+}
+
+vhost_block() {
+    local port="$1" root="$2" php="$3"
+    cat <<EOF
+<VirtualHost *:${port}>
+    ServerName ${DOMAIN}
+    ServerAlias www.${DOMAIN}
+    DocumentRoot "${root}"
+
+    ErrorLog \${APACHE_LOG_DIR}/${DOMAIN}-error.log
+    CustomLog \${APACHE_LOG_DIR}/${DOMAIN}-access.log combined
+EOF
+    if [ "$port" = "443" ]; then
+        cat <<EOF
+
+    SSLEngine on
+    SSLCertificateFile /etc/ssl/${DOMAIN}/${DOMAIN}.crt
+    SSLCertificateKeyFile /etc/ssl/${DOMAIN}/${DOMAIN}.key
+EOF
+    fi
+    cat <<EOF
+
+    <Directory "${root}">
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+EOF
+    php_block "$php"
+    echo "</VirtualHost>"
+}
+
+render_vhost() {
+    local root="$1" php="$2" ssl="$3"
+    cat <<EOF
+${MANAGED_MARKER}. Change it with: ${SCRIPT_NAME} edit --domain ${DOMAIN}
+# sitemgr:docroot=${root}
+# sitemgr:php=${php}
+# sitemgr:ssl=${ssl}
+
+EOF
+    vhost_block 80 "$root" "$php"
+    if [ "$ssl" = "on" ]; then
+        echo
+        vhost_block 443 "$root" "$php"
+    fi
+}
+
+# write_vhost <docroot> <php> <ssl> <enable:yes|no>
+# Backs up the current file, writes the new one, validates with
+# apache2ctl configtest and rolls back if Apache rejects it.
+write_vhost() {
+    local root="$1" php="$2" ssl="$3" enable="$4"
+    local tmp backup="" out
+
+    tmp=$(mktemp)
+    render_vhost "$root" "$php" "$ssl" > "$tmp"
+
+    if [ -f "$VHOST_CONF" ]; then
+        mkdir -p "$BACKUP_DIR"
+        backup="${BACKUP_DIR}/${DOMAIN}.conf.$(date +%Y%m%d-%H%M%S-%N)"
+        cp -p "$VHOST_CONF" "$backup"
+    fi
+
+    install -m 644 "$tmp" "$VHOST_CONF"
+    rm -f "$tmp"
+
+    if [ "$enable" = "yes" ]; then
+        a2ensite -q "${DOMAIN}.conf" > /dev/null
+    fi
+
+    if ! out=$(apache2ctl configtest 2>&1); then
+        echo "❌ Apache rejected the new configuration:"
+        echo "$out" | sed 's/^/   /'
+        if [ -n "$backup" ]; then
+            cp -p "$backup" "$VHOST_CONF"
+            echo "↩️  Restored the previous ${VHOST_CONF}"
+        else
+            a2dissite -q "${DOMAIN}.conf" > /dev/null 2>&1 || true
+            rm -f "$VHOST_CONF"
+            echo "↩️  Removed the new ${VHOST_CONF}"
+        fi
+        exit 1
+    fi
+
+    [ -n "$backup" ] && echo "💾 Previous config saved to ${backup}"
+    echo "📄 Wrote ${VHOST_CONF}"
+    echo "🔁 Reloading Apache..."
+    systemctl reload apache2
+}
+
+require_vhost() {
+    [ -f "$VHOST_CONF" ] || die "No vhost for ${DOMAIN} (${VHOST_CONF} not found)."
+}
+
+require_managed() {
+    require_vhost
+    is_managed "$VHOST_CONF" || die "${DOMAIN} was not created by ${SCRIPT_NAME}. Run: ${SCRIPT_NAME} adopt --domain ${DOMAIN}"
+}
+
+site_urls() {
+    local ssl="$1"
+    if [ "$ssl" = "on" ]; then
+        echo "https://${DOMAIN}"
+    else
+        echo "http://${DOMAIN}"
+    fi
+}
+
+# ---------- commands ----------
+
+cmd_create() {
+    if [ -f "$VHOST_CONF" ]; then
+        if is_managed "$VHOST_CONF"; then
+            die "${DOMAIN} already exists. Use: ${SCRIPT_NAME} edit --domain ${DOMAIN}"
+        fi
+        die "${VHOST_CONF} already exists. Use: ${SCRIPT_NAME} adopt --domain ${DOMAIN}"
+    fi
+
+    resolve_docroot "${DOCROOT:-${BASE_WWW}/html/${DOMAIN}}"
+    local root="$RESOLVED_DOCROOT"
+    local php="${PHP_MODE:-mod_php}"
+    local ssl="${SSL:-on}"
+
+    ensure_docroot "$root"
+    prepare_php "$php"
+    [ "$ssl" = "on" ] && ensure_cert
+
+    write_vhost "$root" "$php" "$ssl" yes
+    hosts_add
+
+    echo "✅ Site ready: $(site_urls "$ssl")"
+}
+
+cmd_edit() {
+    require_managed
+
+    local cur_root cur_php cur_ssl
+    cur_root=$(meta_get "$VHOST_CONF" docroot)
+    cur_php=$(meta_get "$VHOST_CONF" php)
+    cur_ssl=$(meta_get "$VHOST_CONF" ssl)
+
+    local root="$cur_root"
+    if [ -n "$DOCROOT" ]; then
+        resolve_docroot "$DOCROOT"
+        root="$RESOLVED_DOCROOT"
+    fi
+    local php="${PHP_MODE:-$cur_php}"
+    local ssl="${SSL:-$cur_ssl}"
+
+    if [ "$root" = "$cur_root" ] && [ "$php" = "$cur_php" ] && [ "$ssl" = "$cur_ssl" ]; then
+        echo "ℹ️  Nothing to change for ${DOMAIN}."
+        return 0
+    fi
+
+    [ "$root" != "$cur_root" ] && echo "📁 Document root: ${cur_root} → ${root}"
+    [ "$php" != "$cur_php" ]   && echo "🐘 PHP: ${cur_php} → ${php}"
+    [ "$ssl" != "$cur_ssl" ]   && echo "🔐 HTTPS: ${cur_ssl} → ${ssl}"
+
+    ensure_docroot "$root"
+    prepare_php "$php"
+    [ "$ssl" = "on" ] && ensure_cert
+
+    # Keep the enabled/disabled state as it was.
+    write_vhost "$root" "$php" "$ssl" no
+    hosts_add
+
+    if [ "$ssl" = "off" ] && [ "$cur_ssl" = "on" ]; then
+        echo "ℹ️  Certificate kept in /etc/ssl/${DOMAIN} (removed on delete)."
+    fi
+    echo "✅ Updated: $(site_urls "$ssl")"
+}
+
+cmd_delete() {
+    require_managed
+
+    echo "This removes the vhost, the /etc/hosts entry$( [ "$KEEP_CERT" -eq 1 ] || echo " and the certificate") for ${DOMAIN}."
+    echo "The document root and log files are kept."
+    if ! confirm "Continue?"; then
+        echo "Aborted."
+        exit 0
+    fi
+
+    mkdir -p "$BACKUP_DIR"
+    local backup="${BACKUP_DIR}/${DOMAIN}.conf.$(date +%Y%m%d-%H%M%S-%N)"
+    cp -p "$VHOST_CONF" "$backup"
+    echo "💾 Config saved to ${backup}"
+
+    a2dissite -q "${DOMAIN}.conf" > /dev/null 2>&1 || true
+    rm -f "$VHOST_CONF"
+    echo "🗑  Removed ${VHOST_CONF}"
+
+    hosts_remove
+    echo "🗑  Removed /etc/hosts entry"
+
+    if [ "$KEEP_CERT" -ne 1 ]; then
+        remove_cert
+    fi
+
+    echo "🔁 Reloading Apache..."
+    systemctl reload apache2 || true
+    echo "✅ Deleted ${DOMAIN}"
+}
+
+cmd_enable() {
+    require_vhost
+    if is_enabled "$DOMAIN"; then
+        echo "ℹ️  ${DOMAIN} is already enabled."
+        return 0
+    fi
+    a2ensite -q "${DOMAIN}.conf" > /dev/null
+    local out
+    if ! out=$(apache2ctl configtest 2>&1); then
+        a2dissite -q "${DOMAIN}.conf" > /dev/null 2>&1 || true
+        echo "❌ Apache rejected the configuration, site left disabled:"
+        echo "$out" | sed 's/^/   /'
+        exit 1
+    fi
+    systemctl reload apache2
+    echo "✅ Enabled ${DOMAIN}"
+}
+
+cmd_disable() {
+    require_vhost
+    if ! is_enabled "$DOMAIN"; then
+        echo "ℹ️  ${DOMAIN} is already disabled."
+        return 0
+    fi
+    a2dissite -q "${DOMAIN}.conf" > /dev/null
+    systemctl reload apache2
+    echo "✅ Disabled ${DOMAIN}"
+}
+
+cmd_adopt() {
+    require_vhost
+    is_managed "$VHOST_CONF" && die "${DOMAIN} is already managed by ${SCRIPT_NAME}."
+
+    local found_root
+    found_root=$(detect_docroot "$VHOST_CONF")
+    [ -n "$found_root" ] || die "No DocumentRoot found in ${VHOST_CONF}."
+
+    resolve_docroot "${DOCROOT:-$found_root}"
+    local root="$RESOLVED_DOCROOT"
+    local php="${PHP_MODE:-$(detect_php "$VHOST_CONF")}"
+    local ssl="${SSL:-$(detect_ssl "$VHOST_CONF")}"
+
+    echo "Adopting ${DOMAIN}: docroot=${root} php=${php} ssl=${ssl}"
+    echo "The vhost will be rewritten from ${SCRIPT_NAME}'s template; custom directives"
+    echo "in it are dropped (a backup is kept in ${BACKUP_DIR})."
+    if ! confirm "Continue?"; then
+        echo "Aborted."
+        exit 0
+    fi
+
+    local enable="no"
+    is_enabled "$DOMAIN" && enable="yes"
+
+    ensure_docroot "$root"
+    prepare_php "$php"
+    [ "$ssl" = "on" ] && ensure_cert
+
+    write_vhost "$root" "$php" "$ssl" "$enable"
+    hosts_add
+    echo "✅ ${DOMAIN} is now managed by ${SCRIPT_NAME}"
+}
+
+cmd_status() {
+    require_vhost
+
+    local managed="no" root php ssl
+    if is_managed "$VHOST_CONF"; then
+        managed="yes"
+        root=$(meta_get "$VHOST_CONF" docroot)
+        php=$(meta_get "$VHOST_CONF" php)
+        ssl=$(meta_get "$VHOST_CONF" ssl)
+    else
+        root=$(detect_docroot "$VHOST_CONF")
+        php="$(detect_php "$VHOST_CONF") (detected)"
+        ssl="$(detect_ssl "$VHOST_CONF") (detected)"
+    fi
+
+    echo "Status for ${DOMAIN}:"
+    echo
+    echo "📄 Vhost:     ${VHOST_CONF}"
+    echo "   Managed:   ${managed}"
+    echo "   Enabled:   $(is_enabled "$DOMAIN" && echo yes || echo no)"
+    echo "📁 Docroot:   ${root:-unknown} $( [ -n "$root" ] && [ ! -d "$root" ] && echo "(missing!)")"
+    echo "🐘 PHP:       ${php}"
+    case "$php" in
+        fpm:*)
+            local ver="${php#fpm:}"
+            ver="${ver%% *}"
+            echo "   php${ver}-fpm: $(systemctl is-active "php${ver}-fpm" 2>/dev/null || true)"
+            ;;
+        mod_php*)
+            local mods
+            mods=$(ls /etc/apache2/mods-enabled/php*.load 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | tr '\n' ' ' || true)
+            echo "   mod_php:   ${mods:-none enabled}"
+            ;;
+    esac
+    echo "🔐 HTTPS:     ${ssl}"
+    if [ -f "/etc/ssl/${DOMAIN}/${DOMAIN}.crt" ]; then
+        local end_date
+        end_date=$(openssl x509 -enddate -noout -in "/etc/ssl/${DOMAIN}/${DOMAIN}.crt" 2>/dev/null | cut -d= -f2)
+        echo "   Cert expires: ${end_date:-unknown}"
+    fi
+    echo "🌐 Hosts:     $(hosts_present && echo present || echo missing)"
+    echo "🧾 Logs:      ${LOG_DIR}/${DOMAIN}-error.log, ${LOG_DIR}/${DOMAIN}-access.log"
+}
+
+cmd_list() {
+    local conf name managed enabled ssl php root found=0
+
+    if [ "$PORCELAIN" -ne 1 ]; then
+        printf "%-32s %-8s %-8s %-6s %-10s %s\n" "SITE" "MANAGED" "ENABLED" "HTTPS" "PHP" "DOCROOT"
+    fi
+
+    for conf in "${SITES_AVAILABLE}"/*.conf; do
+        [ -f "$conf" ] || continue
+        found=1
+        name=$(basename "$conf" .conf)
+        is_enabled "$name" && enabled="yes" || enabled="no"
+        if is_managed "$conf"; then
+            managed="yes"
+            root=$(meta_get "$conf" docroot)
+            php=$(meta_get "$conf" php)
+            ssl=$(meta_get "$conf" ssl)
+        else
+            managed="no"
+            root=$(detect_docroot "$conf")
+            php=$(detect_php "$conf")
+            ssl=$(detect_ssl "$conf")
+        fi
+
+        if [ "$PORCELAIN" -eq 1 ]; then
+            # name  managed  enabled  ssl  php  docroot
+            printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$name" "$managed" "$enabled" "$ssl" "$php" "$root"
+        else
+            printf "%-32s %-8s %-8s %-6s %-10s %s\n" "$name" "$managed" "$enabled" "$ssl" "$php" "$root"
+        fi
+    done
+
+    if [ "$found" -eq 0 ] && [ "$PORCELAIN" -ne 1 ]; then
+        echo "  (no vhosts in ${SITES_AVAILABLE})"
+    fi
+}
+
+cmd_logs() {
+    local file="${LOG_DIR}/${DOMAIN}-${LOG_KIND}.log"
+    if [ ! -e "$file" ]; then
+        echo "ℹ️  No ${LOG_KIND} log yet: ${file}"
+        return 0
+    fi
+    if [ ! -r "$file" ]; then
+        echo "❌ Cannot read ${file}. Run with sudo, or add yourself to the adm group:"
+        echo "   sudo usermod -aG adm ${REAL_USER}   (then log out and back in)"
+        exit 3
+    fi
+    tail -n "$LOG_LINES" -- "$file"
+}
+
+# ---------- dispatch ----------
+
+case "$COMMAND" in
+    create)  cmd_create ;;
+    edit)    cmd_edit ;;
+    delete)  cmd_delete ;;
+    enable)  cmd_enable ;;
+    disable) cmd_disable ;;
+    adopt)   cmd_adopt ;;
+    status)  cmd_status ;;
+    list)    cmd_list ;;
+    logs)    cmd_logs ;;
+esac
